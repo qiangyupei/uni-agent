@@ -14,6 +14,42 @@ from verl.utils import tensordict_utils as tu
 
 _RUNNER_CALLS = []
 _TEST_INLINE_RUNNERS = {}
+_POSTPROCESSOR_CALLS = []
+_POSTPROCESSOR_EVENTS = []
+_NOT_CALLABLE_POSTPROCESSOR = 42
+
+
+def _recording_trajectory_postprocessor(trajectories, *, enabled=False, policy=None):
+    _POSTPROCESSOR_CALLS.append(
+        {
+            "trajectories": trajectories,
+            "enabled": enabled,
+            "policy": policy,
+        }
+    )
+    return list(reversed(trajectories))
+
+
+async def _async_trajectory_postprocessor(trajectories):
+    await asyncio.sleep(0)
+    return list(trajectories[-1:])
+
+
+def _ordered_trajectory_postprocessor(trajectories):
+    _POSTPROCESSOR_EVENTS.append("postprocess")
+    return list(trajectories)
+
+
+def _tuple_trajectory_postprocessor(trajectories):
+    return tuple(trajectories)
+
+
+def _invalid_item_trajectory_postprocessor(trajectories):
+    return ["not-a-trajectory"]
+
+
+def _raising_trajectory_postprocessor(trajectories):
+    raise ValueError("recipe policy failed")
 
 
 async def _config_recording_runner(*, raw_prompt, session, sample_index, marker=None, **kwargs):
@@ -84,6 +120,8 @@ async def _build_framework_with_agent_runners(
     val_n: int = 1,
     log_dir: str | None = None,
     mask_unfinished_episode: bool = False,
+    trajectory_postprocessor_fqn: str | None = None,
+    trajectory_postprocessor_kwargs: object | None = None,
 ):
     from omegaconf import OmegaConf
 
@@ -93,6 +131,10 @@ async def _build_framework_with_agent_runners(
     }
     if log_dir is not None:
         agent_framework_cfg["log_dir"] = log_dir
+    if trajectory_postprocessor_fqn is not None:
+        agent_framework_cfg["trajectory_postprocessor_fqn"] = trajectory_postprocessor_fqn
+    if trajectory_postprocessor_kwargs is not None:
+        agent_framework_cfg["trajectory_postprocessor_kwargs"] = trajectory_postprocessor_kwargs
 
     config = OmegaConf.create(
         {
@@ -870,6 +912,218 @@ async def test_framework_rejects_unknown_trajectory_selection(fake_tq):
             },
             gateway_manager=_FakeGatewayManager({}),
         )
+
+
+@pytest.mark.asyncio
+async def test_default_trajectory_postprocessor_is_identity_and_never_loads(monkeypatch, fake_tq):
+    from uni_agent.framework import framework as framework_module
+
+    original_load = framework_module.load_class_from_fqn
+
+    def fail_if_postprocessor_loaded(fqn, *, description=None):
+        if description == "trajectory postprocessor":
+            raise AssertionError("default postprocessor path must not import an extension")
+        return original_load(fqn, description=description)
+
+    monkeypatch.setattr(framework_module, "load_class_from_fqn", fail_if_postprocessor_loaded)
+    runtime = _FakeGatewayManager(
+        {
+            "session-sample-0-rollout-0": [
+                _trajectory(response_ids=[20]),
+                _trajectory(response_ids=[30]),
+            ]
+        }
+    )
+    framework = await _build_framework_with_agent_runners(
+        agent_runners={"runner": _inline_runner_config(_async_noop_runner)},
+        gateway_manager=runtime,
+    )
+
+    await framework.generate_sequences(_build_prompts(count=1, global_steps=8))
+
+    assert fake_tq.batch_puts[0]["fields"]["responses"][0].tolist() == [20]
+    assert fake_tq.batch_puts[0]["fields"]["responses"][1].tolist() == [30]
+
+
+@pytest.mark.asyncio
+async def test_trajectory_postprocessor_loads_at_start_and_receives_kwargs(monkeypatch, fake_tq):
+    from uni_agent.framework import framework as framework_module
+
+    load_calls = []
+    original_load = framework_module.load_class_from_fqn
+
+    def recording_load(fqn, *, description=None):
+        load_calls.append((fqn, description))
+        return original_load(fqn, description=description)
+
+    monkeypatch.setattr(framework_module, "load_class_from_fqn", recording_load)
+    _POSTPROCESSOR_CALLS.clear()
+    runtime = _FakeGatewayManager(
+        {
+            "session-sample-0-rollout-0": [
+                _trajectory(response_ids=[20]),
+                _trajectory(response_ids=[30]),
+            ]
+        }
+    )
+    postprocessor_fqn = f"{__name__}._recording_trajectory_postprocessor"
+    framework = await _build_framework_with_agent_runners(
+        agent_runners={"runner": _inline_runner_config(_async_noop_runner)},
+        gateway_manager=runtime,
+        trajectory_postprocessor_fqn=postprocessor_fqn,
+        trajectory_postprocessor_kwargs={"enabled": True, "policy": {"thresholds": [1, 2]}},
+    )
+
+    assert load_calls.count((postprocessor_fqn, "trajectory postprocessor")) == 1
+
+    await framework.generate_sequences(_build_prompts(count=1, global_steps=8))
+
+    assert load_calls.count((postprocessor_fqn, "trajectory postprocessor")) == 1
+    assert len(_POSTPROCESSOR_CALLS) == 1
+    call = _POSTPROCESSOR_CALLS[0]
+    assert isinstance(call["trajectories"], tuple)
+    assert call["enabled"] is True
+    assert call["policy"] == {"thresholds": [1, 2]}
+
+    assert fake_tq.batch_puts[0]["fields"]["responses"][0].tolist() == [30]
+    assert fake_tq.batch_puts[0]["fields"]["responses"][1].tolist() == [20]
+
+
+@pytest.mark.asyncio
+async def test_async_trajectory_postprocessor_is_awaited(fake_tq):
+    runtime = _FakeGatewayManager(
+        {
+            "session-sample-0-rollout-0": [
+                _trajectory(response_ids=[20]),
+                _trajectory(response_ids=[30]),
+            ]
+        }
+    )
+    framework = await _build_framework_with_agent_runners(
+        agent_runners={"runner": _inline_runner_config(_async_noop_runner)},
+        gateway_manager=runtime,
+        trajectory_postprocessor_fqn=f"{__name__}._async_trajectory_postprocessor",
+    )
+
+    await framework.generate_sequences(_build_prompts(count=1, global_steps=8))
+
+    assert fake_tq.batch_puts[0]["keys"] == ["uid-0_0_0"]
+    assert fake_tq.batch_puts[0]["fields"]["responses"][0].tolist() == [30]
+
+
+@pytest.mark.asyncio
+async def test_trajectory_postprocessor_runs_after_finalize_before_scoring_and_logging(monkeypatch, tmp_path, fake_tq):
+    class _OrderedGatewayManager(_FakeGatewayManager):
+        async def finalize_session(self, session_id: str):
+            trajectories = await super().finalize_session(session_id)
+            _POSTPROCESSOR_EVENTS.append("finalize")
+            return trajectories
+
+    _POSTPROCESSOR_EVENTS.clear()
+    runtime = _OrderedGatewayManager({"session-sample-0-rollout-0": [_trajectory()]})
+    framework = await _build_framework_with_agent_runners(
+        agent_runners={"runner": _inline_runner_config(_async_noop_runner)},
+        gateway_manager=runtime,
+        log_dir=str(tmp_path),
+        trajectory_postprocessor_fqn=f"{__name__}._ordered_trajectory_postprocessor",
+    )
+
+    def record_score(trajectories):
+        _POSTPROCESSOR_EVENTS.append("score")
+        return None
+
+    def record_summary(session_id, trajectories):
+        _POSTPROCESSOR_EVENTS.append("summary")
+
+    def record_dump(run_dir, session_id, trajectories):
+        _POSTPROCESSOR_EVENTS.append("dump")
+
+    monkeypatch.setattr(framework, "_score_from_reward_info", record_score)
+    monkeypatch.setattr(framework, "_log_trajectory_summary", record_summary)
+    monkeypatch.setattr(framework, "_dump_trajectories", record_dump)
+
+    await framework.generate_sequences(_build_prompts(count=1, global_steps=8))
+
+    assert _POSTPROCESSOR_EVENTS == ["finalize", "postprocess", "score", "summary", "dump"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("postprocessor_name", "error_type", "error_message"),
+    [
+        ("_tuple_trajectory_postprocessor", TypeError, r"must return list\[Trajectory\], got tuple"),
+        ("_invalid_item_trajectory_postprocessor", TypeError, "returned a non-Trajectory item"),
+        ("_raising_trajectory_postprocessor", ValueError, "recipe policy failed"),
+    ],
+)
+async def test_trajectory_postprocessor_reports_invalid_extensions(
+    fake_tq,
+    postprocessor_name,
+    error_type,
+    error_message,
+):
+    framework = await _build_framework_with_agent_runners(
+        agent_runners={"runner": _inline_runner_config(_async_noop_runner)},
+        gateway_manager=_FakeGatewayManager({}),
+        trajectory_postprocessor_fqn=f"{__name__}.{postprocessor_name}",
+    )
+
+    with pytest.raises(error_type, match=error_message):
+        await framework._apply_trajectory_postprocessor([_trajectory()])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("postprocessor_name", "error_type", "error_message"),
+    [
+        ("_NOT_CALLABLE_POSTPROCESSOR", TypeError, "must resolve to a callable"),
+        ("_missing_trajectory_postprocessor", AttributeError, "not found in module"),
+    ],
+)
+async def test_framework_loads_trajectory_postprocessor_eagerly(
+    fake_tq,
+    postprocessor_name,
+    error_type,
+    error_message,
+):
+    with pytest.raises(error_type, match=error_message):
+        await _build_framework_with_agent_runners(
+            agent_runners={"runner": _inline_runner_config(_async_noop_runner)},
+            gateway_manager=_FakeGatewayManager({}),
+            trajectory_postprocessor_fqn=f"{__name__}.{postprocessor_name}",
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("postprocessor_fqn", "postprocessor_kwargs", "warning_message"),
+    [
+        ("", None, "trajectory_postprocessor_fqn must be a non-empty string"),
+        ("   ", None, "trajectory_postprocessor_fqn must be a non-empty string"),
+        (123, None, "trajectory_postprocessor_fqn must be a non-empty string"),
+        (None, {"enabled": True}, "trajectory_postprocessor_fqn is not set"),
+        (f"{__name__}._recording_trajectory_postprocessor", [1], "must be a mapping"),
+    ],
+)
+async def test_framework_warns_and_disables_invalid_trajectory_postprocessor_config(
+    fake_tq,
+    caplog,
+    postprocessor_fqn,
+    postprocessor_kwargs,
+    warning_message,
+):
+    caplog.set_level(logging.WARNING, logger="uni_agent.framework.framework")
+
+    framework = await _build_framework_with_agent_runners(
+        agent_runners={"runner": _inline_runner_config(_async_noop_runner)},
+        gateway_manager=_FakeGatewayManager({}),
+        trajectory_postprocessor_fqn=postprocessor_fqn,
+        trajectory_postprocessor_kwargs=postprocessor_kwargs,
+    )
+
+    assert framework._trajectory_postprocessor is None
+    assert framework._trajectory_postprocessor_kwargs == {}
+    assert warning_message in caplog.text
 
 
 @pytest.mark.asyncio

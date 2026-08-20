@@ -62,6 +62,66 @@ A finalized trajectory contains:
 
 Before writing to TransferQueue, the Agent Framework derives the full training record, including `input_ids`, attention masks, position IDs, loss masks, and sparse `rm_scores`.
 
+An optional trajectory postprocessor can filter, reorder, or replace the
+finalized trajectories before reward scoring and artifact logging. The order is:
+
+```text
+Gateway finalization
+    -> Runner trajectory_selection (all or longest)
+    -> trajectory postprocessor
+    -> reward scoring
+    -> trajectory logs and TransferQueue
+```
+
+Configure a postprocessor at the Framework level:
+
+```yaml
+actor_rollout_ref:
+  rollout:
+    custom:
+      agent_framework:
+        trajectory_postprocessor_fqn: my_recipe.trajectory.process_trajectories
+        trajectory_postprocessor_kwargs:
+          max_total_tokens: 262144  # 256K prompt + response tokens
+```
+
+The FQN is imported when the Agent Framework starts, so it must be available in
+the AgentFrameworkWorker environment. Malformed FQN or keyword-argument values
+log a warning and leave the hook disabled. A valid non-empty FQN is loaded
+eagerly and must resolve to a callable with this contract:
+
+```python
+from uni_agent.gateway.session import Trajectory
+
+
+def process_trajectories(
+    trajectories: tuple[Trajectory, ...],
+    *,
+    max_total_tokens: int = 262_144,
+) -> list[Trajectory]:
+    return [
+        trajectory
+        for trajectory in trajectories
+        if len(trajectory.prompt_ids) + len(trajectory.response_ids) <= max_total_tokens
+    ]
+```
+
+`trajectory_postprocessor_kwargs` is passed as keyword arguments. The processor
+receives a tuple and must return `list[Trajectory]`; returning an empty list
+filters the session out. An `async def` processor is
+also supported and is awaited. Returned trajectories must keep
+their token arrays aligned because unfinished masking and TransferQueue
+materialization run later.
+
+`max_total_tokens` above is defined by the example processor.
+This compact example drops oversized trajectories; a processor that
+crops them must preserve token-array alignment and valid turn boundaries. A
+processor may define different keyword arguments or none at all.
+
+The hook is disabled when `trajectory_postprocessor_fqn` is omitted or `null`.
+In that case no extension is imported or called, and finalized trajectories
+continue through the original scoring, logging, and TransferQueue path.
+
 The Gateway uses a `MessageCodec` to:
 
 - Apply the model chat template.
@@ -160,6 +220,10 @@ Important knobs include:
 - `enable_last_assistant_rollback`: reuses a chain when only its latest Assistant
   message is rewritten. Defaults to `true`; set it to `false` to preserve the
   previous split-on-rewrite behavior.
+- `trajectory_postprocessor_fqn`: optional import path for a sync or async
+  callable that postprocesses finalized trajectories before reward scoring.
+- `trajectory_postprocessor_kwargs`: optional keyword arguments passed to the
+  postprocessor.
 - `agent_runners`: Runner import paths and arguments.
 - `dispatch_mode`: inline async execution or Ray tasks.
 - `max_concurrent_sessions`: per-Runner concurrency limit.
@@ -175,6 +239,8 @@ Customize the layer that owns the behavior:
 - Implement an Agent Runner to launch a different workload against a Gateway session.
 - Add a Gateway adapter for a new model API wire format.
 - Customize Task, Agent, Tool, and Sandbox behavior through their registries.
+- Implement a trajectory postprocessor for use-case-specific filtering or
+  transformation after finalization and before scoring.
 - Customize reward scoring in the Task or a verl Reward Loop Worker.
 
 Do not put Task logic inside Gateway routes or bypass the Gateway token buffers when training-format trajectories are required.

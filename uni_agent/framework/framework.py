@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import inspect
 import io
 import json
 import logging
 import os
 import random
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, replace
 from functools import partial
 from pathlib import Path
@@ -45,6 +47,9 @@ class AgentRunner(Protocol):
         sample_index: int,
         **sample_runner_kwargs: object,
     ) -> object: ...
+
+
+TrajectoryPostprocessor = Callable[..., list[Trajectory] | Awaitable[list[Trajectory]]]
 
 
 @dataclass
@@ -314,6 +319,8 @@ class OpenAICompatibleAgentFramework(AgentFramework):
         rollout_config=None,
         log_dir: str | None = None,
         mask_unfinished_episode: bool = False,
+        trajectory_postprocessor: TrajectoryPostprocessor | None = None,
+        trajectory_postprocessor_kwargs: dict[str, object] | None = None,
     ):
         self.gateway_manager = gateway_manager
         self.runner_registry = runner_registry
@@ -331,6 +338,8 @@ class OpenAICompatibleAgentFramework(AgentFramework):
         self._semaphore_loop: asyncio.AbstractEventLoop | None = None
         self._log_dir = log_dir
         self._mask_unfinished_episode = mask_unfinished_episode
+        self._trajectory_postprocessor = trajectory_postprocessor
+        self._trajectory_postprocessor_kwargs = trajectory_postprocessor_kwargs or {}
 
     @classmethod
     def from_config(
@@ -364,6 +373,34 @@ class OpenAICompatibleAgentFramework(AgentFramework):
         if type(mask_unfinished_episode) is not bool:
             raise ValueError("actor_rollout_ref.rollout.custom.agent_framework.mask_unfinished_episode must be a bool")
 
+        postprocessor_fqn = af_cfg.get("trajectory_postprocessor_fqn")
+        postprocessor_kwargs = af_cfg.get("trajectory_postprocessor_kwargs")
+        if postprocessor_kwargs is None:
+            postprocessor_kwargs = {}
+        elif OmegaConf.is_config(postprocessor_kwargs):
+            postprocessor_kwargs = OmegaConf.to_container(postprocessor_kwargs, resolve=True)
+
+        trajectory_postprocessor = None
+        trajectory_postprocessor_kwargs = {}
+        if postprocessor_fqn is not None and (not isinstance(postprocessor_fqn, str) or not postprocessor_fqn.strip()):
+            logger.warning("Ignoring trajectory postprocessor: trajectory_postprocessor_fqn must be a non-empty string")
+        elif not isinstance(postprocessor_kwargs, dict):
+            logger.warning("Ignoring trajectory postprocessor: trajectory_postprocessor_kwargs must be a mapping")
+        elif postprocessor_fqn is None:
+            if postprocessor_kwargs:
+                logger.warning(
+                    "Ignoring trajectory_postprocessor_kwargs because trajectory_postprocessor_fqn is not set"
+                )
+        else:
+            postprocessor_fqn = postprocessor_fqn.strip()
+            trajectory_postprocessor = load_class_from_fqn(
+                postprocessor_fqn,
+                description="trajectory postprocessor",
+            )
+            if not callable(trajectory_postprocessor):
+                raise TypeError(f"Trajectory postprocessor {postprocessor_fqn!r} must resolve to a callable")
+            trajectory_postprocessor_kwargs = dict(postprocessor_kwargs)
+
         return cls(
             gateway_manager=gateway_manager,
             runner_registry=runner_registry,
@@ -372,7 +409,24 @@ class OpenAICompatibleAgentFramework(AgentFramework):
             rollout_config=config.actor_rollout_ref.rollout,
             log_dir=log_dir,
             mask_unfinished_episode=mask_unfinished_episode,
+            trajectory_postprocessor=trajectory_postprocessor,
+            trajectory_postprocessor_kwargs=trajectory_postprocessor_kwargs,
         )
+
+    async def _apply_trajectory_postprocessor(
+        self,
+        trajectories: list[Trajectory],
+    ) -> list[Trajectory]:
+        """Apply the optional sync/async postprocessor and validate its result."""
+        result = self._trajectory_postprocessor(tuple(trajectories), **self._trajectory_postprocessor_kwargs)
+        if inspect.isawaitable(result):
+            result = await result
+
+        if not isinstance(result, list):
+            raise TypeError(f"trajectory postprocessor must return list[Trajectory], got {type(result).__name__}")
+        if any(not isinstance(trajectory, Trajectory) for trajectory in result):
+            raise TypeError("trajectory postprocessor returned a non-Trajectory item")
+        return result
 
     def _build_session_sampling_params(
         self,
@@ -738,6 +792,9 @@ class OpenAICompatibleAgentFramework(AgentFramework):
                 logger.exception("session %s failed (runner=%s); aborting session", session_id, runner_name)
                 await self.gateway_manager.abort_session(session_id)
                 raise
+
+            if self._trajectory_postprocessor is not None:
+                session_trajectories = await self._apply_trajectory_postprocessor(session_trajectories)
 
             if not session_trajectories:
                 return session_trajectories, sample_fields
