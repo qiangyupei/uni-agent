@@ -1,0 +1,688 @@
+From 8a86d845dbf8aa465873f95de7f375c08a18b534 Mon Sep 17 00:00:00 2001
+From: qiangyupei <492261796@qq.com>
+Date: Thu, 20 Aug 2026 16:30:11 +0800
+Subject: [PATCH] [framework] feat: add trajectory postprocessor hook
+
+---
+ .../concepts/gateway-and-trajectories.md      |  58 +++++
+ .../test_generate_sequences_on_cpu.py         | 244 ++++++++++++++++++
+ uni_agent/framework/__init__.py               |   3 +
+ uni_agent/framework/framework.py              | 127 ++++++++-
+ .../framework/trajectory_postprocessor.py     |  46 ++++
+ 5 files changed, 477 insertions(+), 1 deletion(-)
+ create mode 100644 uni_agent/framework/trajectory_postprocessor.py
+
+diff --git a/docs/source/concepts/gateway-and-trajectories.md b/docs/source/concepts/gateway-and-trajectories.md
+index 090b8e7..4126d4c 100644
+--- a/docs/source/concepts/gateway-and-trajectories.md
++++ b/docs/source/concepts/gateway-and-trajectories.md
+@@ -62,6 +62,58 @@ A finalized trajectory contains:
+ 
+ Before writing to TransferQueue, the Agent Framework derives the full training record, including `input_ids`, attention masks, position IDs, loss masks, and sparse `rm_scores`.
+ 
++An optional trajectory postprocessor can filter, reorder, or replace the
++finalized trajectories before reward scoring and artifact logging. The order is:
++
++```text
++Gateway finalization
++    -> Runner trajectory_selection (all or longest)
++    -> trajectory postprocessor
++    -> reward scoring
++    -> trajectory logs and TransferQueue
++```
++
++Configure a postprocessor at the Framework level:
++
++```yaml
++actor_rollout_ref:
++  rollout:
++    custom:
++      agent_framework:
++        trajectory_postprocessor_fqn: my_recipe.trajectory.process_trajectories
++        trajectory_postprocessor_kwargs:
++          keep_only_finished: true
++          minimum_model_tokens: 32
++```
++
++The FQN is imported on the first finalized session, not while parsing the
++configuration. It must resolve to a callable with this contract:
++
++```python
++from collections.abc import Sequence
++
++from uni_agent.framework import TrajectoryPostprocessorContext
++from uni_agent.gateway.session import Trajectory
++
++
++def process_trajectories(
++    trajectories: Sequence[Trajectory],
++    *,
++    context: TrajectoryPostprocessorContext,
++) -> list[Trajectory]:
++    minimum = int(context.options.get("minimum_model_tokens", 0))
++    return [trajectory for trajectory in trajectories if sum(trajectory.response_mask) >= minimum]
++```
++
++The input sequence container is immutable. The processor must return a concrete
++`list[Trajectory]`; returning a tuple, generator, or another element type fails
++the session with a descriptive error. Returning an empty list filters the
++session out. An `async def` processor is also supported and is awaited.
++Synchronous processors execute on the Framework event loop and must not perform
++blocking I/O. `context.options` is a deeply read-only JSON-like copy of
++`trajectory_postprocessor_kwargs`; `context.sample_fields` is a read-only view
++of the sample's top-level metadata.
++
+ The Gateway uses a `MessageCodec` to:
+ 
+ - Apply the model chat template.
+@@ -160,6 +212,10 @@ Important knobs include:
+ - `enable_last_assistant_rollback`: reuses a chain when only its latest Assistant
+   message is rewritten. Defaults to `true`; set it to `false` to preserve the
+   previous split-on-rewrite behavior.
++- `trajectory_postprocessor_fqn`: optional import path for a sync or async
++  callable that postprocesses finalized trajectories before reward scoring.
++- `trajectory_postprocessor_kwargs`: optional JSON-like policy settings exposed
++  through the postprocessor context. Requires `trajectory_postprocessor_fqn`.
+ - `agent_runners`: Runner import paths and arguments.
+ - `dispatch_mode`: inline async execution or Ray tasks.
+ - `max_concurrent_sessions`: per-Runner concurrency limit.
+@@ -173,6 +229,8 @@ Important knobs include:
+ Customize the layer that owns the behavior:
+ 
+ - Implement an Agent Runner to launch a different workload against a Gateway session.
++- Implement a trajectory postprocessor for recipe-specific filtering or
++  transformation after finalization and before scoring.
+ - Add a Gateway adapter for a new model API wire format.
+ - Customize Task, Agent, Tool, and Sandbox behavior through their registries.
+ - Customize reward scoring in the Task or a verl Reward Loop Worker.
+diff --git a/tests/uni_agent/framework/test_generate_sequences_on_cpu.py b/tests/uni_agent/framework/test_generate_sequences_on_cpu.py
+index 4356dc5..4a5b7b7 100644
+--- a/tests/uni_agent/framework/test_generate_sequences_on_cpu.py
++++ b/tests/uni_agent/framework/test_generate_sequences_on_cpu.py
+@@ -2,6 +2,7 @@ from __future__ import annotations
+ 
+ import asyncio
+ import logging
++from types import MappingProxyType
+ 
+ import numpy as np
+ import pytest
+@@ -9,11 +10,42 @@ import torch
+ 
+ from tests.uni_agent.support import logging_runner
+ from uni_agent.framework.framework import OpenAICompatibleAgentFramework, _align_routed_experts
++from uni_agent.framework.trajectory_postprocessor import TrajectoryPostprocessorContext
+ from uni_agent.gateway.session import SessionHandle, Trajectory
+ from verl.utils import tensordict_utils as tu
+ 
+ _RUNNER_CALLS = []
+ _TEST_INLINE_RUNNERS = {}
++_POSTPROCESSOR_CALLS = []
++_POSTPROCESSOR_EVENTS = []
++_NOT_CALLABLE_POSTPROCESSOR = 42
++
++
++def _recording_trajectory_postprocessor(trajectories, *, context):
++    _POSTPROCESSOR_CALLS.append({"trajectories": trajectories, "context": context})
++    return list(reversed(trajectories))
++
++
++async def _async_trajectory_postprocessor(trajectories, *, context):
++    await asyncio.sleep(0)
++    return list(trajectories[-1:])
++
++
++def _ordered_trajectory_postprocessor(trajectories, *, context):
++    _POSTPROCESSOR_EVENTS.append("postprocess")
++    return list(trajectories)
++
++
++def _tuple_trajectory_postprocessor(trajectories, *, context):
++    return tuple(trajectories)
++
++
++def _invalid_item_trajectory_postprocessor(trajectories, *, context):
++    return ["not-a-trajectory"]
++
++
++def _raising_trajectory_postprocessor(trajectories, *, context):
++    raise ValueError("recipe policy failed")
+ 
+ 
+ async def _config_recording_runner(*, raw_prompt, session, sample_index, marker=None, **kwargs):
+@@ -84,6 +116,8 @@ async def _build_framework_with_agent_runners(
+     val_n: int = 1,
+     log_dir: str | None = None,
+     mask_unfinished_episode: bool = False,
++    trajectory_postprocessor_fqn: str | None = None,
++    trajectory_postprocessor_kwargs: object | None = None,
+ ):
+     from omegaconf import OmegaConf
+ 
+@@ -93,6 +127,10 @@ async def _build_framework_with_agent_runners(
+     }
+     if log_dir is not None:
+         agent_framework_cfg["log_dir"] = log_dir
++    if trajectory_postprocessor_fqn is not None:
++        agent_framework_cfg["trajectory_postprocessor_fqn"] = trajectory_postprocessor_fqn
++    if trajectory_postprocessor_kwargs is not None:
++        agent_framework_cfg["trajectory_postprocessor_kwargs"] = trajectory_postprocessor_kwargs
+ 
+     config = OmegaConf.create(
+         {
+@@ -862,6 +900,212 @@ async def test_framework_rejects_unknown_trajectory_selection(fake_tq):
+         )
+ 
+ 
++def _test_postprocessor_context() -> TrajectoryPostprocessorContext:
++    return TrajectoryPostprocessorContext(
++        session_id="test-session",
++        runner_name="runner",
++        sample_index=0,
++        session_index=1,
++        partition_id="train",
++        global_steps=8,
++        sample_fields=MappingProxyType({"uid": "uid-0"}),
++        options=MappingProxyType({}),
++    )
++
++
++@pytest.mark.asyncio
++async def test_default_trajectory_postprocessor_is_identity_and_never_loads(monkeypatch, fake_tq):
++    framework = await _build_framework_with_agent_runners(
++        agent_runners={"runner": _inline_runner_config(_async_noop_runner)},
++        gateway_manager=_FakeGatewayManager({}),
++    )
++    trajectories = [_trajectory(response_ids=[20]), _trajectory(response_ids=[30])]
++
++    def fail_if_loaded(*args, **kwargs):
++        raise AssertionError("default postprocessor path must not import an extension")
++
++    monkeypatch.setattr("uni_agent.framework.framework.load_class_from_fqn", fail_if_loaded)
++
++    result = await framework._apply_trajectory_postprocessor(
++        trajectories,
++        context=_test_postprocessor_context(),
++    )
++
++    assert result is trajectories
++
++
++@pytest.mark.asyncio
++async def test_trajectory_postprocessor_loads_lazily_and_receives_context(monkeypatch, fake_tq):
++    from uni_agent.framework import framework as framework_module
++
++    load_calls = []
++    original_load = framework_module.load_class_from_fqn
++
++    def recording_load(fqn, *, description=None):
++        load_calls.append((fqn, description))
++        return original_load(fqn, description=description)
++
++    monkeypatch.setattr(framework_module, "load_class_from_fqn", recording_load)
++    _POSTPROCESSOR_CALLS.clear()
++    runtime = _FakeGatewayManager(
++        {
++            "session-sample-0-rollout-0": [
++                _trajectory(response_ids=[20]),
++                _trajectory(response_ids=[30]),
++            ]
++        }
++    )
++    postprocessor_fqn = f"{__name__}._recording_trajectory_postprocessor"
++    framework = await _build_framework_with_agent_runners(
++        agent_runners={"runner": _inline_runner_config(_async_noop_runner)},
++        gateway_manager=runtime,
++        trajectory_postprocessor_fqn=postprocessor_fqn,
++        trajectory_postprocessor_kwargs={"enabled": True, "policy": {"thresholds": [1, 2]}},
++    )
++
++    assert not any(description == "trajectory postprocessor" for _, description in load_calls)
++
++    await framework.generate_sequences(_build_prompts(count=1, global_steps=8))
++
++    assert load_calls.count((postprocessor_fqn, "trajectory postprocessor")) == 1
++    assert len(_POSTPROCESSOR_CALLS) == 1
++    call = _POSTPROCESSOR_CALLS[0]
++    assert isinstance(call["trajectories"], tuple)
++    context = call["context"]
++    assert context.session_id.startswith("session-sample-0-rollout-0-")
++    assert context.runner_name == "runner"
++    assert context.sample_index == 0
++    assert context.session_index == 0
++    assert context.partition_id == "train"
++    assert context.global_steps == 8
++    assert context.sample_fields["uid"] == "uid-0"
++    assert context.options["enabled"] is True
++    assert context.options["policy"]["thresholds"] == (1, 2)
++    with pytest.raises(TypeError):
++        context.sample_fields["uid"] = "changed"
++    with pytest.raises(TypeError):
++        context.options["enabled"] = False
++    with pytest.raises(TypeError):
++        context.options["policy"]["new"] = 1
++
++    assert fake_tq.batch_puts[0]["fields"]["responses"][0].tolist() == [30]
++    assert fake_tq.batch_puts[0]["fields"]["responses"][1].tolist() == [20]
++
++
++@pytest.mark.asyncio
++async def test_async_trajectory_postprocessor_is_awaited(fake_tq):
++    runtime = _FakeGatewayManager(
++        {
++            "session-sample-0-rollout-0": [
++                _trajectory(response_ids=[20]),
++                _trajectory(response_ids=[30]),
++            ]
++        }
++    )
++    framework = await _build_framework_with_agent_runners(
++        agent_runners={"runner": _inline_runner_config(_async_noop_runner)},
++        gateway_manager=runtime,
++        trajectory_postprocessor_fqn=f"{__name__}._async_trajectory_postprocessor",
++    )
++
++    await framework.generate_sequences(_build_prompts(count=1, global_steps=8))
++
++    assert fake_tq.batch_puts[0]["keys"] == ["uid-0_0_0"]
++    assert fake_tq.batch_puts[0]["fields"]["responses"][0].tolist() == [30]
++
++
++@pytest.mark.asyncio
++async def test_trajectory_postprocessor_runs_after_finalize_before_scoring_and_logging(monkeypatch, tmp_path, fake_tq):
++    class _OrderedGatewayManager(_FakeGatewayManager):
++        async def finalize_session(self, session_id: str):
++            trajectories = await super().finalize_session(session_id)
++            _POSTPROCESSOR_EVENTS.append("finalize")
++            return trajectories
++
++    _POSTPROCESSOR_EVENTS.clear()
++    runtime = _OrderedGatewayManager({"session-sample-0-rollout-0": [_trajectory()]})
++    framework = await _build_framework_with_agent_runners(
++        agent_runners={"runner": _inline_runner_config(_async_noop_runner)},
++        gateway_manager=runtime,
++        log_dir=str(tmp_path),
++        trajectory_postprocessor_fqn=f"{__name__}._ordered_trajectory_postprocessor",
++    )
++
++    def record_score(trajectories):
++        _POSTPROCESSOR_EVENTS.append("score")
++        return None
++
++    def record_summary(session_id, trajectories):
++        _POSTPROCESSOR_EVENTS.append("summary")
++
++    def record_dump(run_dir, session_id, trajectories):
++        _POSTPROCESSOR_EVENTS.append("dump")
++
++    monkeypatch.setattr(framework, "_score_from_reward_info", record_score)
++    monkeypatch.setattr(framework, "_log_trajectory_summary", record_summary)
++    monkeypatch.setattr(framework, "_dump_trajectories", record_dump)
++
++    await framework.generate_sequences(_build_prompts(count=1, global_steps=8))
++
++    assert _POSTPROCESSOR_EVENTS == ["finalize", "postprocess", "score", "summary", "dump"]
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize(
++    ("postprocessor_name", "error_type", "error_message"),
++    [
++        ("_NOT_CALLABLE_POSTPROCESSOR", TypeError, "must resolve to a callable"),
++        ("_tuple_trajectory_postprocessor", TypeError, r"must return list\[Trajectory\], got tuple"),
++        ("_invalid_item_trajectory_postprocessor", TypeError, "non-Trajectory item at index 0: str"),
++        ("_raising_trajectory_postprocessor", RuntimeError, "failed for session 'test-session'"),
++        ("_missing_trajectory_postprocessor", RuntimeError, "Failed to load trajectory postprocessor"),
++    ],
++)
++async def test_trajectory_postprocessor_reports_invalid_extensions(
++    fake_tq,
++    postprocessor_name,
++    error_type,
++    error_message,
++):
++    framework = await _build_framework_with_agent_runners(
++        agent_runners={"runner": _inline_runner_config(_async_noop_runner)},
++        gateway_manager=_FakeGatewayManager({}),
++        trajectory_postprocessor_fqn=f"{__name__}.{postprocessor_name}",
++    )
++
++    with pytest.raises(error_type, match=error_message):
++        await framework._apply_trajectory_postprocessor(
++            [_trajectory()],
++            context=_test_postprocessor_context(),
++        )
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize(
++    ("postprocessor_fqn", "postprocessor_kwargs", "error_message"),
++    [
++        ("", None, "trajectory_postprocessor_fqn must be a non-empty string or null"),
++        (123, None, "trajectory_postprocessor_fqn must be a non-empty string or null"),
++        (None, {"enabled": True}, "trajectory_postprocessor_kwargs requires trajectory_postprocessor_fqn"),
++        (f"{__name__}._recording_trajectory_postprocessor", [1], "must be a mapping"),
++        (f"{__name__}._recording_trajectory_postprocessor", {"value": float("nan")}, "finite JSON numbers"),
++    ],
++)
++async def test_framework_rejects_invalid_trajectory_postprocessor_config(
++    fake_tq,
++    postprocessor_fqn,
++    postprocessor_kwargs,
++    error_message,
++):
++    with pytest.raises(ValueError, match=error_message):
++        await _build_framework_with_agent_runners(
++            agent_runners={"runner": _inline_runner_config(_async_noop_runner)},
++            gateway_manager=_FakeGatewayManager({}),
++            trajectory_postprocessor_fqn=postprocessor_fqn,
++            trajectory_postprocessor_kwargs=postprocessor_kwargs,
++        )
++
++
+ @pytest.mark.asyncio
+ async def test_generate_sequences_keeps_successful_sessions_when_one_session_fails(fake_tq):
+     """A failed rollout session aborts only that session; other successful
+diff --git a/uni_agent/framework/__init__.py b/uni_agent/framework/__init__.py
+index fd922f1..c116630 100644
+--- a/uni_agent/framework/__init__.py
++++ b/uni_agent/framework/__init__.py
+@@ -1,8 +1,11 @@
+ from .base import AgentFramework
+ from .framework import AgentRunner, OpenAICompatibleAgentFramework
++from .trajectory_postprocessor import TrajectoryPostprocessor, TrajectoryPostprocessorContext
+ 
+ __all__ = [
+     "AgentFramework",
+     "AgentRunner",
+     "OpenAICompatibleAgentFramework",
++    "TrajectoryPostprocessor",
++    "TrajectoryPostprocessorContext",
+ ]
+diff --git a/uni_agent/framework/framework.py b/uni_agent/framework/framework.py
+index 4272a35..1cc1d54 100644
+--- a/uni_agent/framework/framework.py
++++ b/uni_agent/framework/framework.py
+@@ -2,15 +2,19 @@ from __future__ import annotations
+ 
+ import asyncio
+ import contextlib
++import inspect
+ import io
+ import json
+ import logging
++import math
+ import os
+ import random
++from collections.abc import Mapping
+ from dataclasses import dataclass, replace
+ from functools import partial
+ from pathlib import Path
+-from typing import Protocol
++from types import MappingProxyType
++from typing import Protocol, cast
+ from uuid import uuid4
+ 
+ import numpy as np
+@@ -30,6 +34,7 @@ from verl.utils.transferqueue_utils import tq
+ 
+ from .base import AgentFramework
+ from .multi_modal_postprocess import compute_multi_modal_inputs, compute_position_ids
++from .trajectory_postprocessor import TrajectoryPostprocessor, TrajectoryPostprocessorContext
+ 
+ logger = logging.getLogger(__name__)
+ 
+@@ -103,6 +108,26 @@ def _materialize_runner(runner_fqn: str, runner_kwargs: dict[str, object]):
+     return runner
+ 
+ 
++def _freeze_json_like(value: object, *, path: str) -> object:
++    """Validate and deeply freeze a JSON-like configuration value."""
++    if value is None or isinstance(value, str | bool | int):
++        return value
++    if isinstance(value, float):
++        if not math.isfinite(value):
++            raise ValueError(f"{path} must contain finite JSON numbers")
++        return value
++    if isinstance(value, list):
++        return tuple(_freeze_json_like(item, path=f"{path}[{index}]") for index, item in enumerate(value))
++    if isinstance(value, dict):
++        frozen: dict[str, object] = {}
++        for key, item in value.items():
++            if not isinstance(key, str):
++                raise ValueError(f"{path} keys must be strings, got {type(key).__name__}")
++            frozen[key] = _freeze_json_like(item, path=f"{path}.{key}")
++        return MappingProxyType(frozen)
++    raise ValueError(f"{path} must be JSON-like, got {type(value).__name__}")
++
++
+ def _log_scope(log_context: LogContext | None):
+     if log_context is None:
+         return contextlib.nullcontext()
+@@ -296,6 +321,8 @@ class OpenAICompatibleAgentFramework(AgentFramework):
+         rollout_config=None,
+         log_dir: str | None = None,
+         mask_unfinished_episode: bool = False,
++        trajectory_postprocessor_fqn: str | None = None,
++        trajectory_postprocessor_options: Mapping[str, object] | None = None,
+     ):
+         self.gateway_manager = gateway_manager
+         self.runner_registry = runner_registry
+@@ -313,6 +340,9 @@ class OpenAICompatibleAgentFramework(AgentFramework):
+         self._semaphore_loop: asyncio.AbstractEventLoop | None = None
+         self._log_dir = log_dir
+         self._mask_unfinished_episode = mask_unfinished_episode
++        self._trajectory_postprocessor_fqn = trajectory_postprocessor_fqn
++        self._trajectory_postprocessor_options = trajectory_postprocessor_options or MappingProxyType({})
++        self._trajectory_postprocessor: TrajectoryPostprocessor | None = None
+ 
+     @classmethod
+     def from_config(
+@@ -346,6 +376,31 @@ class OpenAICompatibleAgentFramework(AgentFramework):
+         if type(mask_unfinished_episode) is not bool:
+             raise ValueError("actor_rollout_ref.rollout.custom.agent_framework.mask_unfinished_episode must be a bool")
+ 
++        trajectory_postprocessor_fqn = af_cfg.get("trajectory_postprocessor_fqn")
++        if trajectory_postprocessor_fqn is not None and (
++            not isinstance(trajectory_postprocessor_fqn, str) or not trajectory_postprocessor_fqn.strip()
++        ):
++            raise ValueError(
++                "actor_rollout_ref.rollout.custom.agent_framework.trajectory_postprocessor_fqn "
++                "must be a non-empty string or null"
++            )
++
++        raw_postprocessor_options = af_cfg.get("trajectory_postprocessor_kwargs", {})
++        if raw_postprocessor_options is None:
++            raw_postprocessor_options = {}
++        if OmegaConf.is_config(raw_postprocessor_options):
++            raw_postprocessor_options = OmegaConf.to_container(raw_postprocessor_options, resolve=True)
++        if not isinstance(raw_postprocessor_options, dict):
++            raise ValueError(
++                "actor_rollout_ref.rollout.custom.agent_framework.trajectory_postprocessor_kwargs must be a mapping"
++            )
++        trajectory_postprocessor_options = cast(
++            MappingProxyType,
++            _freeze_json_like(raw_postprocessor_options, path="trajectory_postprocessor_kwargs"),
++        )
++        if trajectory_postprocessor_fqn is None and trajectory_postprocessor_options:
++            raise ValueError("trajectory_postprocessor_kwargs requires trajectory_postprocessor_fqn")
++
+         return cls(
+             gateway_manager=gateway_manager,
+             runner_registry=runner_registry,
+@@ -354,8 +409,56 @@ class OpenAICompatibleAgentFramework(AgentFramework):
+             rollout_config=config.actor_rollout_ref.rollout,
+             log_dir=log_dir,
+             mask_unfinished_episode=mask_unfinished_episode,
++            trajectory_postprocessor_fqn=trajectory_postprocessor_fqn,
++            trajectory_postprocessor_options=trajectory_postprocessor_options,
+         )
+ 
++    def _get_trajectory_postprocessor(self) -> TrajectoryPostprocessor | None:
++        """Load and cache the configured postprocessor on first use."""
++        if self._trajectory_postprocessor_fqn is None:
++            return None
++        if self._trajectory_postprocessor is None:
++            fqn = self._trajectory_postprocessor_fqn
++            try:
++                candidate = load_class_from_fqn(fqn, description="trajectory postprocessor")
++            except Exception as exc:
++                raise RuntimeError(f"Failed to load trajectory postprocessor {fqn!r}") from exc
++            if not callable(candidate):
++                raise TypeError(f"Trajectory postprocessor {fqn!r} must resolve to a callable")
++            self._trajectory_postprocessor = cast(TrajectoryPostprocessor, candidate)
++        return self._trajectory_postprocessor
++
++    async def _apply_trajectory_postprocessor(
++        self,
++        trajectories: list[Trajectory],
++        *,
++        context: TrajectoryPostprocessorContext,
++    ) -> list[Trajectory]:
++        """Apply the optional sync/async postprocessor and validate its result."""
++        processor = self._get_trajectory_postprocessor()
++        if processor is None:
++            return trajectories
++
++        fqn = self._trajectory_postprocessor_fqn
++        try:
++            result = processor(tuple(trajectories), context=context)
++            if inspect.isawaitable(result):
++                result = await result
++        except Exception as exc:
++            raise RuntimeError(f"Trajectory postprocessor {fqn!r} failed for session {context.session_id!r}") from exc
++
++        if not isinstance(result, list):
++            raise TypeError(
++                f"Trajectory postprocessor {fqn!r} must return list[Trajectory], got {type(result).__name__}"
++            )
++        for index, trajectory in enumerate(result):
++            if not isinstance(trajectory, Trajectory):
++                raise TypeError(
++                    f"Trajectory postprocessor {fqn!r} returned a non-Trajectory item "
++                    f"at index {index}: {type(trajectory).__name__}"
++                )
++        return result
++
+     def _build_session_sampling_params(
+         self,
+         *,
+@@ -509,6 +612,7 @@ class OpenAICompatibleAgentFramework(AgentFramework):
+                 sample_index=sample_index,
+                 session_index=session_index,
+                 global_steps=global_steps,
++                partition_id=partition_id,
+                 sampling_params=sampling_params,
+             )
+             for session_index in range(num_sessions)
+@@ -580,6 +684,7 @@ class OpenAICompatibleAgentFramework(AgentFramework):
+         sample_index: int,
+         session_index: int,
+         global_steps: int | None,
++        partition_id: str,
+         sampling_params: dict[str, object],
+     ) -> tuple[list[Trajectory], dict[str, object]]:
+         # Lazy-init semaphores on first use and rebind if the running loop
+@@ -611,6 +716,7 @@ class OpenAICompatibleAgentFramework(AgentFramework):
+                 sample_index=sample_index,
+                 session_index=session_index,
+                 global_steps=global_steps,
++                partition_id=partition_id,
+                 runner_name=runner_name,
+                 runner_config=runner_config,
+                 sampling_params=sampling_params,
+@@ -627,6 +733,7 @@ class OpenAICompatibleAgentFramework(AgentFramework):
+                 sample_index=sample_index,
+                 session_index=session_index,
+                 global_steps=global_steps,
++                partition_id=partition_id,
+                 runner_name=runner_name,
+                 runner_config=runner_config,
+                 sampling_params=sampling_params,
+@@ -639,6 +746,7 @@ class OpenAICompatibleAgentFramework(AgentFramework):
+         sample_index: int,
+         session_index: int,
+         global_steps: int | None,
++        partition_id: str,
+         runner_name: str,
+         runner_config: _RunnerConfig,
+         sampling_params: dict[str, object],
+@@ -705,6 +813,23 @@ class OpenAICompatibleAgentFramework(AgentFramework):
+                 await self.gateway_manager.abort_session(session_id)
+                 raise
+ 
++            # The Gateway session is released and its built-in retention policy
++            # has run. Apply the optional Framework hook before reward scoring
++            # or trajectory logging occurs.
++            session_trajectories = await self._apply_trajectory_postprocessor(
++                session_trajectories,
++                context=TrajectoryPostprocessorContext(
++                    session_id=session_id,
++                    runner_name=runner_name,
++                    sample_index=sample_index,
++                    session_index=session_index,
++                    partition_id=partition_id,
++                    global_steps=global_steps,
++                    sample_fields=MappingProxyType(sample_fields),
++                    options=self._trajectory_postprocessor_options,
++                ),
++            )
++
+             if not session_trajectories:
+                 return session_trajectories, sample_fields
+ 
+diff --git a/uni_agent/framework/trajectory_postprocessor.py b/uni_agent/framework/trajectory_postprocessor.py
+new file mode 100644
+index 0000000..d6dd956
+--- /dev/null
++++ b/uni_agent/framework/trajectory_postprocessor.py
+@@ -0,0 +1,46 @@
++"""Public contract for postprocessing finalized Gateway trajectories."""
++
++from __future__ import annotations
++
++from collections.abc import Awaitable, Mapping, Sequence
++from dataclasses import dataclass
++from typing import Protocol
++
++from uni_agent.gateway.session import Trajectory
++
++
++@dataclass(frozen=True)
++class TrajectoryPostprocessorContext:
++    """Read-only session context passed to a trajectory postprocessor.
++
++    ``sample_fields`` is the sample metadata extracted from the input batch. Its
++    top-level mapping is read-only; values retain their original types.
++    ``options`` is a deeply read-only, JSON-like copy of the configured
++    ``trajectory_postprocessor_kwargs``.
++    """
++
++    session_id: str
++    runner_name: str
++    sample_index: int
++    session_index: int
++    partition_id: str
++    global_steps: int | None
++    sample_fields: Mapping[str, object]
++    options: Mapping[str, object]
++
++
++class TrajectoryPostprocessor(Protocol):
++    """Callable contract for filtering or transforming finalized trajectories.
++
++    Implementations receive an immutable sequence container and must return a
++    concrete ``list[Trajectory]``. A synchronous result is consumed directly;
++    an awaitable result is awaited by the Framework. Synchronous processors run
++    on the Framework event loop and therefore must not perform blocking I/O.
++    """
++
++    def __call__(
++        self,
++        trajectories: Sequence[Trajectory],
++        *,
++        context: TrajectoryPostprocessorContext,
++    ) -> list[Trajectory] | Awaitable[list[Trajectory]]: ...
+-- 
+2.51.0.windows.2
+
