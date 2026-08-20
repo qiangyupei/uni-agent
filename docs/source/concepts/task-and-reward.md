@@ -160,6 +160,16 @@ training. The Agent Framework owns that policy through
 inference, evaluation, and different training runs without embedding optimizer
 behavior in the Task or dataset.
 
+### TaskResult metadata
+
+With the `report_reward=true` option, the generic Task Runner merges
+non-reserved `TaskResult.extra_info` fields into the session's `reward_info`.
+`reward`, `acc`, and `finished` remain canonical; colliding fields are ignored.
+The forwarded fields must be JSON serializable and at most 64 KiB after
+serialization. Otherwise, they are omitted with a warning while the canonical
+fields remain in the reward payload. Use this channel for compact metrics and
+labels, not logs or artifacts.
+
 ## Dataset Contract
 
 Preprocessing should serialize the sample-specific Task configuration into each dataset row:

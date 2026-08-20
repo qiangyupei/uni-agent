@@ -99,6 +99,10 @@ The built-in Task Runner posts:
 }
 ```
 
+With `report_reward=true`, the Task Runner can also forward bounded,
+use-case-specific metadata through `TaskResult.extra_info`; see
+[TaskResult metadata](task-and-reward.md#taskresult-metadata).
+
 The Agent Framework reads the session reward, applies it to finalized trajectories, and writes a sparse token-level `rm_scores` tensor with the reward on the final token.
 
 Agent completion is factual session metadata; the Framework, not the Task, decides how training consumes it. When the training configuration enables `mask_unfinished_episode`, a session with `finished=false` is still written and tagged as successful, but its TransferQueue `response_mask` and `loss_mask` are all zero so it does not contribute policy gradients, loss-normalization counts, or auxiliary losses.

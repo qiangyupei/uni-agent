@@ -1,7 +1,11 @@
+import json
+import logging
+
 import pytest
 
 from uni_agent.framework import task_runner
 from uni_agent.framework.task_runner import (
+    _MAX_TASK_RESULT_EXTRA_INFO_BYTES,
     _extract_upstream,
     _inject_gateway_tunnel,
     _reward_info_from_result,
@@ -133,3 +137,61 @@ async def test_run_task_binds_raw_prompt_to_sample_task_config(monkeypatch, tmp_
     )
 
     assert captured["config"].prompt == source_prompt
+
+
+def test_reward_info_forwards_extra_info_without_replacing_reserved_keys(caplog):
+    result = TaskResult(
+        reward=0.75,
+        accuracy=1.0,
+        finished=True,
+        extra_info={
+            "reward": 99,
+            "acc": 0,
+            "finished": False,
+            "train_best": 3,
+            "verifier": {"passed": True, "speedup": 1.25},
+        },
+    )
+
+    with caplog.at_level(logging.WARNING):
+        reward_info = _reward_info_from_result(result)
+
+    assert reward_info == {
+        "reward": 0.75,
+        "acc": 1.0,
+        "finished": True,
+        "train_best": 3,
+        "verifier": {"passed": True, "speedup": 1.25},
+    }
+    assert "ignoring reserved TaskResult.extra_info keys: acc, finished, reward" in caplog.text
+
+
+@pytest.mark.parametrize("extra_info", [{"invalid": object()}, {"not_finite": float("nan")}])
+def test_reward_info_omits_invalid_extra_info(extra_info, caplog):
+    result = TaskResult(reward=0.5, extra_info=extra_info)
+
+    with caplog.at_level(logging.WARNING):
+        assert _reward_info_from_result(result) == {"reward": 0.5}
+    assert "metadata must be JSON serializable" in caplog.text
+
+
+def test_reward_info_handles_json_recursion_error(monkeypatch):
+    def raise_recursion_error(*args, **kwargs):
+        raise RecursionError
+
+    monkeypatch.setattr(task_runner.json, "dumps", raise_recursion_error)
+    result = TaskResult(reward=0.5, extra_info={"nested": {}})
+
+    assert _reward_info_from_result(result) == {"reward": 0.5}
+
+
+def test_reward_info_enforces_serialized_size_limit():
+    oversized = TaskResult(reward=0.5, extra_info={"text": "x" * _MAX_TASK_RESULT_EXTRA_INFO_BYTES})
+    assert _reward_info_from_result(oversized) == {"reward": 0.5}
+
+    empty_payload_size = len(json.dumps({"text": ""}).encode("utf-8"))
+    at_limit = {"text": "x" * (_MAX_TASK_RESULT_EXTRA_INFO_BYTES - empty_payload_size)}
+    assert _reward_info_from_result(TaskResult(reward=0.5, extra_info=at_limit)) == {
+        "reward": 0.5,
+        **at_limit,
+    }

@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse
@@ -14,6 +15,9 @@ if TYPE_CHECKING:
     from uni_agent.gateway.session import SessionHandle
 
 logger = logging.getLogger(__name__)
+
+_MAX_TASK_RESULT_EXTRA_INFO_BYTES = 64 * 1024
+_REWARD_INFO_RESERVED_KEYS = frozenset({"reward", "acc", "finished"})
 
 
 def _rewrite_gateway_url(gateway_url: str, proxy_port: int) -> str:
@@ -168,4 +172,45 @@ def _reward_info_from_result(result: TaskResult) -> dict[str, Any]:
         reward_info["acc"] = result.accuracy
     if result.finished is not None:
         reward_info["finished"] = result.finished
+
+    extra_info = result.extra_info
+    if extra_info is None:
+        return reward_info
+    if not isinstance(extra_info, dict):
+        logger.warning(
+            "omitting TaskResult.extra_info from reward_info: expected a dict, got %s",
+            type(extra_info).__name__,
+        )
+        return reward_info
+
+    conflicting_keys = sorted(_REWARD_INFO_RESERVED_KEYS.intersection(extra_info))
+    if conflicting_keys:
+        logger.warning(
+            "ignoring reserved TaskResult.extra_info keys: %s",
+            ", ".join(conflicting_keys),
+        )
+    forwarded_extra_info = {key: value for key, value in extra_info.items() if key not in _REWARD_INFO_RESERVED_KEYS}
+    if not forwarded_extra_info:
+        return reward_info
+
+    try:
+        serialized = json.dumps(forwarded_extra_info, allow_nan=False)
+    except (TypeError, ValueError, OverflowError, RecursionError) as exc:
+        logger.warning(
+            "omitting TaskResult.extra_info from reward_info: metadata must be JSON serializable (%s: %s)",
+            type(exc).__name__,
+            exc,
+        )
+        return reward_info
+
+    serialized_bytes = len(serialized.encode("utf-8"))
+    if serialized_bytes > _MAX_TASK_RESULT_EXTRA_INFO_BYTES:
+        logger.warning(
+            "omitting TaskResult.extra_info from reward_info: serialized metadata is %d bytes; limit is %d bytes",
+            serialized_bytes,
+            _MAX_TASK_RESULT_EXTRA_INFO_BYTES,
+        )
+        return reward_info
+
+    reward_info.update(forwarded_extra_info)
     return reward_info
