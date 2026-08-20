@@ -1,0 +1,41 @@
+- name: triton_operator
+  sandbox:
+    provider: openyuanrong
+    image: REPLACE_WITH_PINNED_TRITON_AGENT_NPU_IMAGE_DIGEST
+    runtime_timeout: 4200
+    sandbox_kwargs:
+      cwd: /workspace
+      idle_timeout: 4800
+  agent:
+    name: claude_code
+    max_turns: 120
+    run_timeout: 1800
+    extra_args:
+      - --disable-slash-commands
+    model:
+      temperature: 1.0
+      top_p: 1.0
+      max_total_tokens: 131072
+  workspace_dir: /workspace
+  template_dir: /opt/triton-agent-template
+  setup_timeout: 120
+  verify_timeout: 1200
+  verify_command: /opt/triton-agent-tools/with_npu_lease.py -- /opt/triton-agent-tools/final_verify.sh {op_name} {workspace_dir}
+  npu_lease_command: /opt/triton-agent-tools/with_npu_lease.py
+  npu_lease_required: true
+  agent_verify_entrypoint: tools/verify_once.sh
+  trusted_agent_verify_command: /opt/triton-agent-tools/verify_once.sh
+  enforce_trusted_image: true
+  trusted_tool_paths:
+    - /opt/triton-agent-tools/with_npu_lease.py
+    - /opt/triton-agent-tools/verify_once.sh
+    - /opt/triton-agent-tools/final_verify.sh
+    - /opt/triton-agent-tools/cleanup_task_processes.sh
+  cleanup_timeout: 30
+  cleanup_command: /opt/triton-agent-tools/cleanup_task_processes.sh
+  # Opt in only after a real Gateway test proves retry chain/attempt identity.
+  retry_on_missing_impl: false
+  install_transcript_hooks: true
+  artifact_dir: null
+  artifact_timeout: 120
+  max_artifact_bytes: 2097152

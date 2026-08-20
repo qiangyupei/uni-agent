@@ -1,0 +1,5 @@
+{
+  "cases": [
+    {"shape": [8, 8], "dtype": "float32"}
+  ]
+}

@@ -1,0 +1,591 @@
+From 2b746fe91a6678dfee01a0778b0125a38ae5aa3e Mon Sep 17 00:00:00 2001
+From: qiangyupei <492261796@qq.com>
+Date: Thu, 20 Aug 2026 16:20:41 +0800
+Subject: [PATCH] [framework, tasks, docs] feat: forward task result metadata
+
+---
+ .../concepts/gateway-and-trajectories.md      |  17 +-
+ docs/source/concepts/task-and-reward.md       |  17 +
+ tests/uni_agent/framework/test_task_runner.py | 291 +++++++++++++++++-
+ uni_agent/framework/task_runner.py            | 124 +++++++-
+ uni_agent/tasks/base.py                       |   7 +-
+ 5 files changed, 445 insertions(+), 11 deletions(-)
+
+diff --git a/docs/source/concepts/gateway-and-trajectories.md b/docs/source/concepts/gateway-and-trajectories.md
+index 090b8e7..0352f88 100644
+--- a/docs/source/concepts/gateway-and-trajectories.md
++++ b/docs/source/concepts/gateway-and-trajectories.md
+@@ -99,6 +99,20 @@ The built-in Task Runner posts:
+ }
+ ```
+ 
++With `report_reward=true`, compact JSON-compatible fields from
++`TaskResult.extra_info` are merged into this `reward_info` object. The canonical
++`reward`, `acc`, and `finished` keys cannot be replaced by `extra_info`. The Task
++runner omits invalid, excessively nested, or oversized metadata and still posts
++the canonical fields.
++
++Reward posting is best-effort by default. Set `report_reward=true` and
++`reward_post_strict=true` in the Task runner's `runner_kwargs` when the session
++must abort rather than finalize with a missing or stale reward. In strict mode, a
++missing reward endpoint, an invalid or oversized payload, a transport failure, or
++a non-success HTTP response propagates from the Runner. Strict delivery is not an
++access-control mechanism: deployments must still authenticate or otherwise
++restrict the session-scoped reward endpoint to trusted callers.
++
+ The Agent Framework reads the session reward, applies it to finalized trajectories, and writes a sparse token-level `rm_scores` tensor with the reward on the final token.
+ 
+ Agent completion is factual session metadata; the Framework, not the Task, decides how training consumes it. When the training configuration enables `mask_unfinished_episode`, a session with `finished=false` is still written and tagged as successful, but its TransferQueue `response_mask` and `loss_mask` are all zero so it does not contribute policy gradients, loss-normalization counts, or auxiliary losses.
+@@ -139,7 +153,8 @@ The trainer's ReplayBuffer consumes completed records independently of rollout t
+ - A prompt is marked `finished` when any of its sessions succeeds.
+ - A prompt is marked `failure` when all sessions fail.
+ - A batch raises only when every rollout fails.
+-- Reward reporting is best-effort and logs failures.
++- Reward reporting is best-effort and logs failures by default; the generic Task
++  runner's opt-in `reward_post_strict=true` propagates them and aborts its session.
+ 
+ This isolation is important for long-horizon workloads, where session latency and failure modes vary widely.
+ 
+diff --git a/docs/source/concepts/task-and-reward.md b/docs/source/concepts/task-and-reward.md
+index 74fec67..c3f18fb 100644
+--- a/docs/source/concepts/task-and-reward.md
++++ b/docs/source/concepts/task-and-reward.md
+@@ -120,6 +120,23 @@ training. The Agent Framework owns that policy through
+ inference, evaluation, and different training runs without embedding optimizer
+ behavior in the Task or dataset.
+ 
++When the generic Task runner is configured with `report_reward=true`, it also
++merges `TaskResult.extra_info` into the session's `reward_info`. Use it for
++compact metrics and labels needed by reward or trajectory processing. The keys
++`reward`, `acc`, and `finished` are reserved for the corresponding `TaskResult`
++fields; colliding keys in `extra_info` are ignored. Metadata must be JSON
++serializable, contain at most eight nested containers, and serialize to at most
++64 KiB. Invalid or oversized metadata is omitted with a warning while the
++canonical reward fields are still reported. Store source code, evaluator output,
++and other large artifacts outside `extra_info`.
++
++Reward reporting is best-effort by default. For training runs where a missing or
++stale Task reward must abort the session, set both `report_reward=true` and
++`reward_post_strict=true` in the Task runner's `runner_kwargs`. Strict mode
++propagates a missing reward endpoint, an invalid or oversized payload, transport
++errors, and non-success HTTP responses to the Agent Framework. This option makes
++delivery fail closed; it does not authenticate or authorize the Gateway endpoint.
++
+ ## Dataset Contract
+ 
+ Preprocessing should serialize the sample-specific Task configuration into each dataset row:
+diff --git a/tests/uni_agent/framework/test_task_runner.py b/tests/uni_agent/framework/test_task_runner.py
+index c12f288..7cc5bc7 100644
+--- a/tests/uni_agent/framework/test_task_runner.py
++++ b/tests/uni_agent/framework/test_task_runner.py
+@@ -1,9 +1,167 @@
++import json
++import logging
++from types import SimpleNamespace
++
++import aiohttp
+ import pytest
+ 
+-from uni_agent.framework.task_runner import _reward_info_from_result
++from uni_agent.framework import task_runner
++from uni_agent.framework.task_runner import (
++    MAX_TASK_RESULT_EXTRA_INFO_BYTES,
++    MAX_TASK_RESULT_EXTRA_INFO_DEPTH,
++    _reward_info_from_result,
++)
+ from uni_agent.tasks import TaskResult
+ 
+ 
++@pytest.mark.asyncio
++async def test_run_task_only_reports_extra_info_when_enabled(monkeypatch):
++    result = TaskResult(reward=0.5, extra_info={"train_best": 2})
++
++    class FakeResolver:
++        def resolve(self, sample_config, *, runtime_model):
++            assert sample_config == {"name": "fake"}
++            assert runtime_model["base_url"] == "http://gateway/v1"
++            return sample_config
++
++    class FakeTask:
++        async def run(self):
++            return result
++
++    posted: list[tuple[str, dict[str, object], bool]] = []
++
++    async def capture_post(url, task_result, *, strict=False):
++        posted.append((url, _reward_info_from_result(task_result, strict=strict), strict))
++
++    monkeypatch.setattr(task_runner, "TaskConfigResolver", FakeResolver)
++    monkeypatch.setattr(task_runner, "get_task", lambda _: FakeTask())
++    monkeypatch.setattr(task_runner, "_post_reward_info", capture_post)
++    session = SimpleNamespace(
++        base_url="http://gateway/v1",
++        reward_info_url="http://gateway/sessions/test/reward_info",
++    )
++
++    common_kwargs = {
++        "session": session,
++        "tools_kwargs": {"task": {"name": "fake"}},
++    }
++    assert await task_runner.run_task(**common_kwargs, report_reward=False) is result
++    assert posted == []
++
++    assert await task_runner.run_task(**common_kwargs, report_reward=True) is result
++    assert posted == [
++        (
++            "http://gateway/sessions/test/reward_info",
++            {"reward": 0.5, "train_best": 2},
++            False,
++        )
++    ]
++
++    assert await task_runner.run_task(**common_kwargs, report_reward=True, reward_post_strict=True) is result
++    assert posted[-1] == (
++        "http://gateway/sessions/test/reward_info",
++        {"reward": 0.5, "train_best": 2},
++        True,
++    )
++
++    session.reward_info_url = None
++    assert await task_runner.run_task(**common_kwargs, report_reward=False, reward_post_strict=True) is result
++    with pytest.raises(RuntimeError, match="strict reward posting requires"):
++        await task_runner.run_task(**common_kwargs, report_reward=True, reward_post_strict=True)
++
++
++class _FakePostResponse:
++    def __init__(self, http_error: Exception | None = None):
++        self.http_error = http_error
++
++    async def __aenter__(self):
++        return self
++
++    async def __aexit__(self, *exc):
++        return None
++
++    def raise_for_status(self):
++        if self.http_error is not None:
++            raise self.http_error
++
++
++class _FakeClientSession:
++    def __init__(self, posts, *, post_error=None, http_error=None):
++        self.posts = posts
++        self.post_error = post_error
++        self.http_error = http_error
++
++    async def __aenter__(self):
++        return self
++
++    async def __aexit__(self, *exc):
++        return None
++
++    def post(self, url, *, json):
++        if self.post_error is not None:
++            raise self.post_error
++        self.posts.append((url, json))
++        return _FakePostResponse(self.http_error)
++
++
++@pytest.mark.asyncio
++async def test_reward_post_strict_success(monkeypatch):
++    posts = []
++    monkeypatch.setattr(
++        aiohttp,
++        "ClientSession",
++        lambda *, timeout: _FakeClientSession(posts),
++    )
++    result = TaskResult(reward=0.5, accuracy=1.0, extra_info={"source": "verifier"})
++
++    await task_runner._post_reward_info("http://gateway/reward_info", result, strict=True)
++
++    assert posts == [
++        (
++            "http://gateway/reward_info",
++            {"reward_info": {"reward": 0.5, "acc": 1.0, "source": "verifier"}},
++        )
++    ]
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("failure_stage", ["post", "http"])
++async def test_reward_post_strict_propagates_transport_and_http_failures(monkeypatch, caplog, failure_stage):
++    error = RuntimeError(f"{failure_stage} failed")
++
++    def client_session(*, timeout):
++        return _FakeClientSession(
++            [],
++            post_error=error if failure_stage == "post" else None,
++            http_error=error if failure_stage == "http" else None,
++        )
++
++    monkeypatch.setattr(aiohttp, "ClientSession", client_session)
++    result = TaskResult(reward=0.5)
++
++    with caplog.at_level(logging.WARNING):
++        await task_runner._post_reward_info("http://gateway/reward_info", result)
++    assert f"{failure_stage} failed" in caplog.text
++
++    with pytest.raises(RuntimeError, match=f"{failure_stage} failed"):
++        await task_runner._post_reward_info("http://gateway/reward_info", result, strict=True)
++
++
++@pytest.mark.asyncio
++async def test_reward_post_strict_rejects_serialization_failure_before_post(monkeypatch):
++    def unexpected_client_session(*, timeout):
++        raise AssertionError("strict payload validation must run before opening a client session")
++
++    monkeypatch.setattr(aiohttp, "ClientSession", unexpected_client_session)
++
++    with pytest.raises(ValueError, match="TaskResult.extra_info must be JSON serializable"):
++        await task_runner._post_reward_info(
++            "http://gateway/reward_info",
++            TaskResult(reward=0.5, extra_info={"invalid": object()}),
++            strict=True,
++        )
++
++
+ def test_task_result_positional_field_order():
+     result = TaskResult(0.5, 1.0, False, {"reason": "limit"})
+ 
+@@ -37,3 +195,134 @@ def test_reward_info_rejects_non_boolean_agent_completion():
+ 
+     with pytest.raises(ValueError, match="finished must be a bool or None"):
+         _reward_info_from_result(result)
++
++
++def test_reward_info_forwards_json_serializable_extra_info():
++    result = TaskResult(
++        reward=0.75,
++        accuracy=1.0,
++        finished=True,
++        extra_info={"train_best": 3, "verifier": {"passed": True, "speedup": 1.25}},
++    )
++
++    assert _reward_info_from_result(result) == {
++        "reward": 0.75,
++        "acc": 1.0,
++        "finished": True,
++        "train_best": 3,
++        "verifier": {"passed": True, "speedup": 1.25},
++    }
++
++
++@pytest.mark.parametrize("extra_info", [None, {}])
++def test_reward_info_empty_extra_info_preserves_original_payload(extra_info):
++    result = TaskResult(reward=0.5, accuracy=1.0, finished=False, extra_info=extra_info)
++
++    assert _reward_info_from_result(result) == {
++        "reward": 0.5,
++        "acc": 1.0,
++        "finished": False,
++    }
++
++
++def test_reward_info_extra_info_cannot_replace_reserved_keys(caplog):
++    result = TaskResult(
++        reward=0.5,
++        accuracy=1.0,
++        finished=False,
++        extra_info={"reward": 99, "acc": 0, "finished": True, "label": "verified"},
++    )
++
++    with caplog.at_level(logging.WARNING):
++        reward_info = _reward_info_from_result(result)
++
++    assert reward_info == {
++        "reward": 0.5,
++        "acc": 1.0,
++        "finished": False,
++        "label": "verified",
++    }
++    assert "ignoring reserved TaskResult.extra_info keys: acc, finished, reward" in caplog.text
++
++
++@pytest.mark.parametrize(
++    ("extra_info", "warning"),
++    [
++        ({"not_json": object()}, "metadata must be JSON serializable"),
++        ({"not_finite": float("nan")}, "metadata must be JSON serializable"),
++        ({"nested": {1: "not-a-string-key"}}, "metadata object keys must be strings"),
++    ],
++)
++def test_reward_info_omits_non_json_extra_info(extra_info, warning, caplog):
++    result = TaskResult(reward=0.5, accuracy=1.0, extra_info=extra_info)
++
++    with caplog.at_level(logging.WARNING):
++        reward_info = _reward_info_from_result(result)
++
++    assert reward_info == {"reward": 0.5, "acc": 1.0}
++    assert warning in caplog.text
++
++
++def test_reward_info_omits_non_mapping_extra_info(caplog):
++    result = TaskResult(reward=0.5, extra_info=[])  # type: ignore[arg-type]
++
++    with caplog.at_level(logging.WARNING):
++        reward_info = _reward_info_from_result(result)
++
++    assert reward_info == {"reward": 0.5}
++    assert "expected a dict, got list" in caplog.text
++
++
++def test_reward_info_omits_excessively_nested_extra_info(caplog):
++    nested: object = "leaf"
++    for _ in range(MAX_TASK_RESULT_EXTRA_INFO_DEPTH):
++        nested = {"next": nested}
++    result = TaskResult(reward=0.5, extra_info={"root": nested})
++
++    with caplog.at_level(logging.WARNING):
++        reward_info = _reward_info_from_result(result)
++
++    assert reward_info == {"reward": 0.5}
++    assert f"metadata nesting depth exceeds {MAX_TASK_RESULT_EXTRA_INFO_DEPTH}" in caplog.text
++
++
++def test_reward_info_accepts_extra_info_at_nesting_limit():
++    extra_info: dict[str, object] = {"leaf": True}
++    for _ in range(MAX_TASK_RESULT_EXTRA_INFO_DEPTH - 1):
++        extra_info = {"next": extra_info}
++
++    reward_info = _reward_info_from_result(TaskResult(reward=0.5, extra_info=extra_info))
++
++    assert reward_info == {"reward": 0.5, **extra_info}
++
++
++def test_reward_info_omits_cyclic_extra_info(caplog):
++    cycle: dict[str, object] = {}
++    cycle["self"] = cycle
++    result = TaskResult(reward=0.5, extra_info=cycle)
++
++    with caplog.at_level(logging.WARNING):
++        reward_info = _reward_info_from_result(result)
++
++    assert reward_info == {"reward": 0.5}
++    assert "metadata contains a circular reference" in caplog.text
++
++
++def test_reward_info_omits_oversized_extra_info(caplog):
++    result = TaskResult(reward=0.5, extra_info={"text": "x" * MAX_TASK_RESULT_EXTRA_INFO_BYTES})
++
++    with caplog.at_level(logging.WARNING):
++        reward_info = _reward_info_from_result(result)
++
++    assert reward_info == {"reward": 0.5}
++    assert "serialized metadata" in caplog.text
++    assert f"limit is {MAX_TASK_RESULT_EXTRA_INFO_BYTES} bytes" in caplog.text
++
++
++def test_reward_info_accepts_extra_info_at_serialized_size_limit():
++    empty_payload_size = len(json.dumps({"text": ""}).encode("utf-8"))
++    extra_info = {"text": "x" * (MAX_TASK_RESULT_EXTRA_INFO_BYTES - empty_payload_size)}
++
++    reward_info = _reward_info_from_result(TaskResult(reward=0.5, extra_info=extra_info))
++
++    assert reward_info == {"reward": 0.5, **extra_info}
+diff --git a/uni_agent/framework/task_runner.py b/uni_agent/framework/task_runner.py
+index 63c04f1..7decabe 100644
+--- a/uni_agent/framework/task_runner.py
++++ b/uni_agent/framework/task_runner.py
+@@ -3,6 +3,7 @@
+ 
+ from __future__ import annotations
+ 
++import json
+ import logging
+ from typing import TYPE_CHECKING, Any
+ 
+@@ -13,6 +14,13 @@ if TYPE_CHECKING:
+ 
+ logger = logging.getLogger(__name__)
+ 
++# Reward info is retained by the Gateway for the lifetime of a session. Keep the
++# generic Task runner's metadata deliberately small and shallow so a Task cannot
++# accidentally turn a compact scalar reward into a large in-memory artifact.
++MAX_TASK_RESULT_EXTRA_INFO_BYTES = 64 * 1024
++MAX_TASK_RESULT_EXTRA_INFO_DEPTH = 8
++_REWARD_INFO_RESERVED_KEYS = frozenset({"reward", "acc", "finished"})
++
+ 
+ async def run_task(
+     *,
+@@ -24,6 +32,7 @@ async def run_task(
+     api_key: str = "EMPTY",
+     model_name: str | None = None,
+     report_reward: bool = False,
++    reward_post_strict: bool = False,
+     **_: Any,
+ ) -> TaskResult:
+     """Resolve the sample's task, run it against ``session``, and return its result.
+@@ -37,6 +46,9 @@ async def run_task(
+     sample values, and the live endpoint in order. When ``report_reward`` is set,
+     the task's reward + info are POSTed back to the session's reward-info endpoint;
+     the standalone evaluator reads the returned :class:`TaskResult` directly.
++    Posting remains best-effort by default. Set ``reward_post_strict`` to make a
++    missing endpoint, invalid payload, network error, or HTTP error abort the
++    runner so the framework cannot finalize the session with stale reward data.
+     """
+     sample_config = tools_kwargs.get("task") if tools_kwargs else None
+     if not isinstance(sample_config, dict):
+@@ -58,9 +70,12 @@ async def run_task(
+     result = await get_task(task).run()
+ 
+     reward_posted = False
+-    if report_reward and session.reward_info_url:
+-        await _post_reward_info(session.reward_info_url, result)
+-        reward_posted = True
++    if report_reward:
++        if session.reward_info_url:
++            await _post_reward_info(session.reward_info_url, result, strict=reward_post_strict)
++            reward_posted = True
++        elif reward_post_strict:
++            raise RuntimeError("strict reward posting requires session.reward_info_url")
+     logger.info(
+         "run_task done: task=%s reward=%s acc=%s finished=%s reward_posted=%s",
+         task_name,
+@@ -72,22 +87,29 @@ async def run_task(
+     return result
+ 
+ 
+-async def _post_reward_info(reward_info_url: str, result: TaskResult) -> None:
+-    """Best-effort POST of task reward, accuracy, and Agent completion."""
++async def _post_reward_info(reward_info_url: str, result: TaskResult, *, strict: bool = False) -> None:
++    """POST task reward metadata, optionally propagating every failure."""
+     import aiohttp
+ 
+-    reward_info = _reward_info_from_result(result)
++    reward_info = _reward_info_from_result(result, strict=strict)
+     try:
++        if strict:
++            try:
++                json.dumps({"reward_info": reward_info}, allow_nan=False)
++            except (TypeError, ValueError, OverflowError) as exc:
++                raise ValueError(f"reward_info payload must be JSON serializable: {exc}") from exc
+         timeout = aiohttp.ClientTimeout(total=None)
+         async with aiohttp.ClientSession(timeout=timeout) as session:
+             async with session.post(reward_info_url, json={"reward_info": reward_info}) as response:
+                 response.raise_for_status()
+         logger.debug("posted reward_info to %s: %s", reward_info_url, reward_info)
+-    except Exception as exc:  # noqa: BLE001 - reward-info is best-effort telemetry
++    except Exception as exc:  # noqa: BLE001 - strict mode re-raises after logging
+         logger.warning("failed to post reward_info to %s: %s: %s", reward_info_url, type(exc).__name__, exc)
++        if strict:
++            raise
+ 
+ 
+-def _reward_info_from_result(result: TaskResult) -> dict[str, Any]:
++def _reward_info_from_result(result: TaskResult, *, strict: bool = False) -> dict[str, Any]:
+     """Build the session reward payload consumed by the trajectory framework."""
+     if result.finished is not None and type(result.finished) is not bool:
+         raise ValueError("TaskResult.finished must be a bool or None")
+@@ -96,4 +118,90 @@ def _reward_info_from_result(result: TaskResult) -> dict[str, Any]:
+         reward_info["acc"] = result.accuracy
+     if result.finished is not None:
+         reward_info["finished"] = result.finished
++
++    extra_info = result.extra_info
++    if extra_info is None:
++        return reward_info
++    if not isinstance(extra_info, dict):
++        if strict:
++            raise TypeError(f"TaskResult.extra_info must be a dict, got {type(extra_info).__name__}")
++        logger.warning(
++            "omitting TaskResult.extra_info from reward_info: expected a dict, got %s",
++            type(extra_info).__name__,
++        )
++        return reward_info
++    if not extra_info:
++        return reward_info
++
++    conflicting_keys = sorted(_REWARD_INFO_RESERVED_KEYS.intersection(extra_info))
++    if conflicting_keys:
++        logger.warning(
++            "ignoring reserved TaskResult.extra_info keys: %s",
++            ", ".join(conflicting_keys),
++        )
++    forwarded_extra_info = {key: value for key, value in extra_info.items() if key not in _REWARD_INFO_RESERVED_KEYS}
++    if not forwarded_extra_info:
++        return reward_info
++
++    try:
++        _validate_extra_info_nesting(forwarded_extra_info)
++        serialized = json.dumps(forwarded_extra_info, allow_nan=False)
++    except (TypeError, ValueError, OverflowError) as exc:
++        if strict:
++            raise ValueError(
++                "TaskResult.extra_info must be JSON serializable "
++                f"with at most {MAX_TASK_RESULT_EXTRA_INFO_DEPTH} nested containers: {exc}"
++            ) from exc
++        logger.warning(
++            "omitting TaskResult.extra_info from reward_info: metadata must be JSON serializable "
++            "with at most %d nested containers (%s: %s)",
++            MAX_TASK_RESULT_EXTRA_INFO_DEPTH,
++            type(exc).__name__,
++            exc,
++        )
++        return reward_info
++
++    serialized_bytes = len(serialized.encode("utf-8"))
++    if serialized_bytes > MAX_TASK_RESULT_EXTRA_INFO_BYTES:
++        if strict:
++            raise ValueError(
++                f"TaskResult.extra_info is {serialized_bytes} serialized bytes; "
++                f"limit is {MAX_TASK_RESULT_EXTRA_INFO_BYTES} bytes"
++            )
++        logger.warning(
++            "omitting TaskResult.extra_info from reward_info: serialized metadata is %d bytes; limit is %d bytes",
++            serialized_bytes,
++            MAX_TASK_RESULT_EXTRA_INFO_BYTES,
++        )
++        return reward_info
++
++    reward_info.update(forwarded_extra_info)
+     return reward_info
++
++
++def _validate_extra_info_nesting(value: Any, *, depth: int = 1, active_containers: set[int] | None = None) -> None:
++    """Reject cyclic or excessively nested JSON containers before serialization."""
++    if not isinstance(value, dict | list | tuple):
++        return
++    if depth > MAX_TASK_RESULT_EXTRA_INFO_DEPTH:
++        raise ValueError(f"metadata nesting depth exceeds {MAX_TASK_RESULT_EXTRA_INFO_DEPTH}")
++
++    if active_containers is None:
++        active_containers = set()
++    container_id = id(value)
++    if container_id in active_containers:
++        raise ValueError("metadata contains a circular reference")
++
++    active_containers.add(container_id)
++    try:
++        if isinstance(value, dict):
++            for key in value:
++                if not isinstance(key, str):
++                    raise TypeError(f"metadata object keys must be strings, got {type(key).__name__}")
++            children = value.values()
++        else:
++            children = value
++        for child in children:
++            _validate_extra_info_nesting(child, depth=depth + 1, active_containers=active_containers)
++    finally:
++        active_containers.remove(container_id)
+diff --git a/uni_agent/tasks/base.py b/uni_agent/tasks/base.py
+index c719d43..8e914f8 100644
+--- a/uni_agent/tasks/base.py
++++ b/uni_agent/tasks/base.py
+@@ -67,7 +67,12 @@ class TaskConfig(BaseModel):
+ 
+ @dataclasses.dataclass
+ class TaskResult:
+-    """Outcome of one task episode."""
++    """Outcome of one task episode.
++
++    When the generic Task runner enables reward reporting, JSON-compatible
++    :attr:`extra_info` is attached to the session's reward metadata. It is for
++    compact scalar metrics and labels, not logs or artifacts.
++    """
+ 
+     reward: Any
+     accuracy: float | None = None
+-- 
+2.51.0.windows.2
+
