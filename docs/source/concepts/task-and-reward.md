@@ -170,6 +170,20 @@ serialization. Otherwise, they are omitted with a warning while the canonical
 fields remain in the reward payload. Use this channel for compact metrics and
 labels, not logs or artifacts.
 
+### Strict reward delivery
+
+Reward reporting is best-effort by default. To abort the session when delivery
+fails, configure the Task Runner with:
+
+```yaml
+runner_kwargs:
+  report_reward: true
+  reward_post_strict: true
+```
+
+Strict mode propagates a missing reward endpoint, the 30-second POST timeout,
+transport errors, and non-success HTTP responses.
+
 ## Dataset Contract
 
 Preprocessing should serialize the sample-specific Task configuration into each dataset row:

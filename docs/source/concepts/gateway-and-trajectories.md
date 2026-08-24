@@ -143,7 +143,9 @@ The trainer's ReplayBuffer consumes completed records independently of rollout t
 - A prompt is marked `finished` when any of its sessions succeeds.
 - A prompt is marked `failure` when all sessions fail.
 - A batch raises only when every rollout fails.
-- Reward reporting is best-effort and logs failures.
+- Reward reporting is best-effort by default. See
+  [Strict reward delivery](task-and-reward.md#strict-reward-delivery) for opt-in
+  failure propagation.
 
 This isolation is important for long-horizon workloads, where session latency and failure modes vary widely.
 

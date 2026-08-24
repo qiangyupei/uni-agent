@@ -18,6 +18,7 @@ logger = logging.getLogger(__name__)
 
 _MAX_TASK_RESULT_EXTRA_INFO_BYTES = 64 * 1024
 _REWARD_INFO_RESERVED_KEYS = frozenset({"reward", "acc", "finished"})
+_REWARD_POST_TIMEOUT_SECONDS = 30.0
 
 
 def _rewrite_gateway_url(gateway_url: str, proxy_port: int) -> str:
@@ -88,6 +89,7 @@ async def run_task(
     api_key: str = "EMPTY",
     model_name: str | None = None,
     report_reward: bool = False,
+    reward_post_strict: bool = False,
     **_: Any,
 ) -> TaskResult:
     """Resolve the sample's task, run it against ``session``, and return its result.
@@ -101,6 +103,8 @@ async def run_task(
     sample values, and the live endpoint in order. When ``report_reward`` is set,
     the task's reward + info are POSTed back to the session's reward-info endpoint;
     the standalone evaluator reads the returned :class:`TaskResult` directly.
+    Posting remains best-effort by default. Set ``reward_post_strict`` to abort
+    the runner when the reward endpoint is missing or delivery fails.
     """
     sample_config = tools_kwargs.get("task") if tools_kwargs else None
     if not isinstance(sample_config, dict):
@@ -134,9 +138,16 @@ async def run_task(
     result = await task_instance.run()
 
     reward_posted = False
-    if report_reward and session.reward_info_url:
-        await _post_reward_info(session.reward_info_url, result)
-        reward_posted = True
+    if report_reward:
+        if session.reward_info_url:
+            await _post_reward_info(
+                session.reward_info_url,
+                result,
+                strict=reward_post_strict,
+            )
+            reward_posted = True
+        elif reward_post_strict:
+            raise RuntimeError("strict reward posting requires session.reward_info_url")
     logger.info(
         "run_task done: task=%s reward=%s acc=%s finished=%s reward_posted=%s",
         task_name,
@@ -148,19 +159,21 @@ async def run_task(
     return result
 
 
-async def _post_reward_info(reward_info_url: str, result: TaskResult) -> None:
-    """Best-effort POST of task reward, accuracy, and Agent completion."""
+async def _post_reward_info(reward_info_url: str, result: TaskResult, *, strict: bool = False) -> None:
+    """POST task reward metadata, optionally propagating delivery failures."""
     import aiohttp
 
     reward_info = _reward_info_from_result(result)
     try:
-        timeout = aiohttp.ClientTimeout(total=None)
+        timeout = aiohttp.ClientTimeout(total=_REWARD_POST_TIMEOUT_SECONDS)
         async with aiohttp.ClientSession(timeout=timeout) as session:
             async with session.post(reward_info_url, json={"reward_info": reward_info}) as response:
                 response.raise_for_status()
         logger.debug("posted reward_info to %s: %s", reward_info_url, reward_info)
-    except Exception as exc:  # noqa: BLE001 - reward-info is best-effort telemetry
+    except Exception as exc:  # noqa: BLE001 - strict mode re-raises after logging
         logger.warning("failed to post reward_info to %s: %s: %s", reward_info_url, type(exc).__name__, exc)
+        if strict:
+            raise
 
 
 def _reward_info_from_result(result: TaskResult) -> dict[str, Any]:

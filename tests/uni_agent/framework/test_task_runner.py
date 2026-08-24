@@ -1,11 +1,14 @@
 import json
 import logging
+from types import SimpleNamespace
 
+import aiohttp
 import pytest
 
 from uni_agent.framework import task_runner
 from uni_agent.framework.task_runner import (
     _MAX_TASK_RESULT_EXTRA_INFO_BYTES,
+    _REWARD_POST_TIMEOUT_SECONDS,
     _extract_upstream,
     _inject_gateway_tunnel,
     _reward_info_from_result,
@@ -137,6 +140,109 @@ async def test_run_task_binds_raw_prompt_to_sample_task_config(monkeypatch, tmp_
     )
 
     assert captured["config"].prompt == source_prompt
+
+
+@pytest.mark.asyncio
+async def test_run_task_forwards_strict_reward_policy(monkeypatch):
+    result = TaskResult(reward=0.5)
+
+    class _FakeResolver:
+        def resolve(self, sample_config, *, runtime_model):
+            return sample_config
+
+    class _FakeTask:
+        async def run(self):
+            return result
+
+    posted = []
+
+    async def capture_post(url, task_result, *, strict=False):
+        posted.append((url, task_result, strict))
+
+    monkeypatch.setattr(task_runner, "TaskConfigResolver", _FakeResolver)
+    monkeypatch.setattr(task_runner, "get_task", lambda _: _FakeTask())
+    monkeypatch.setattr(task_runner, "_post_reward_info", capture_post)
+    session = SimpleNamespace(base_url="http://gateway/v1", reward_info_url="http://gateway/reward_info")
+    kwargs = {"session": session, "tools_kwargs": {"task": {"name": "fake"}}}
+
+    await task_runner.run_task(**kwargs, report_reward=False, reward_post_strict=True)
+    assert posted == []
+
+    await task_runner.run_task(**kwargs, report_reward=True)
+    assert posted == [(session.reward_info_url, result, False)]
+
+    posted.clear()
+    await task_runner.run_task(**kwargs, report_reward=True, reward_post_strict=True)
+    assert posted == [(session.reward_info_url, result, True)]
+
+    session.reward_info_url = None
+    with pytest.raises(RuntimeError, match="strict reward posting requires"):
+        await task_runner.run_task(**kwargs, report_reward=True, reward_post_strict=True)
+
+
+class _FakeClientSession:
+    def __init__(self, posts, *, post_error=None, response_error=None):
+        self.posts = posts
+        self.post_error = post_error
+        self.response_error = response_error
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return None
+
+    def post(self, url, *, json):
+        if self.post_error:
+            raise self.post_error
+        self.posts.append((url, json))
+        return self
+
+    def raise_for_status(self):
+        if self.response_error:
+            raise self.response_error
+
+
+@pytest.mark.asyncio
+async def test_strict_reward_post_succeeds_with_bounded_timeout_and_omitted_invalid_metadata(monkeypatch):
+    posts = []
+    timeouts = []
+
+    def client_session(*, timeout):
+        timeouts.append(timeout.total)
+        return _FakeClientSession(posts)
+
+    monkeypatch.setattr(aiohttp, "ClientSession", client_session)
+    result = TaskResult(reward=0.5, accuracy=1.0, extra_info={"invalid": object()})
+
+    await task_runner._post_reward_info("http://gateway/reward_info", result, strict=True)
+    assert timeouts == [_REWARD_POST_TIMEOUT_SECONDS]
+    assert posts == [
+        (
+            "http://gateway/reward_info",
+            {"reward_info": {"reward": 0.5, "acc": 1.0}},
+        )
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure_stage", ["post", "response"])
+async def test_reward_post_failure_is_best_effort_or_strict(monkeypatch, failure_stage):
+    error = RuntimeError(f"{failure_stage} failed")
+
+    def client_session(*, timeout):
+        return _FakeClientSession(
+            [],
+            post_error=error if failure_stage == "post" else None,
+            response_error=error if failure_stage == "response" else None,
+        )
+
+    monkeypatch.setattr(aiohttp, "ClientSession", client_session)
+    result = TaskResult(reward=0.5)
+
+    await task_runner._post_reward_info("http://gateway/reward_info", result)
+    with pytest.raises(RuntimeError, match=f"{failure_stage} failed"):
+        await task_runner._post_reward_info("http://gateway/reward_info", result, strict=True)
 
 
 def test_reward_info_forwards_extra_info_without_replacing_reserved_keys(caplog):
