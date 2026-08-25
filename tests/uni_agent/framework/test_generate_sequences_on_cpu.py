@@ -1004,16 +1004,6 @@ async def test_trajectory_postprocessor_rejects_dropped_reward_info():
 
 
 @pytest.mark.asyncio
-async def test_framework_rejects_non_callable_trajectory_postprocessor():
-    with pytest.raises(TypeError, match="must resolve to a callable"):
-        await _build_framework_with_agent_runners(
-            agent_runners={"runner": _inline_runner_config(_async_noop_runner)},
-            gateway_manager=_FakeGatewayManager({}),
-            trajectory_postprocessor_fqn=f"{__name__}._NOT_CALLABLE_POSTPROCESSOR",
-        )
-
-
-@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("postprocessor_fqn", "postprocessor_kwargs", "error_type", "error_message"),
     [
@@ -1021,6 +1011,7 @@ async def test_framework_rejects_non_callable_trajectory_postprocessor():
         (123, None, ValueError, "trajectory_postprocessor_fqn must be a non-empty string"),
         (None, {"enabled": True}, ValueError, "requires trajectory_postprocessor_fqn"),
         (f"{__name__}._recording_trajectory_postprocessor", [1], TypeError, "must be a mapping"),
+        (f"{__name__}._NOT_CALLABLE_POSTPROCESSOR", None, TypeError, "must resolve to a callable"),
     ],
 )
 async def test_framework_rejects_invalid_trajectory_postprocessor_config(
