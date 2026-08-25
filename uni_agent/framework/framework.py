@@ -9,6 +9,7 @@ import logging
 import os
 import random
 from collections.abc import Awaitable, Callable
+from copy import deepcopy
 from dataclasses import dataclass, replace
 from functools import partial
 from pathlib import Path
@@ -382,16 +383,14 @@ class OpenAICompatibleAgentFramework(AgentFramework):
 
         trajectory_postprocessor = None
         trajectory_postprocessor_kwargs = {}
-        if postprocessor_fqn is not None and (not isinstance(postprocessor_fqn, str) or not postprocessor_fqn.strip()):
-            logger.warning("Ignoring trajectory postprocessor: trajectory_postprocessor_fqn must be a non-empty string")
-        elif not isinstance(postprocessor_kwargs, dict):
-            logger.warning("Ignoring trajectory postprocessor: trajectory_postprocessor_kwargs must be a mapping")
-        elif postprocessor_fqn is None:
+        if postprocessor_fqn is None:
             if postprocessor_kwargs:
-                logger.warning(
-                    "Ignoring trajectory_postprocessor_kwargs because trajectory_postprocessor_fqn is not set"
-                )
+                raise ValueError("trajectory_postprocessor_kwargs requires trajectory_postprocessor_fqn")
         else:
+            if not isinstance(postprocessor_fqn, str) or not postprocessor_fqn.strip():
+                raise ValueError("trajectory_postprocessor_fqn must be a non-empty string")
+            if not isinstance(postprocessor_kwargs, dict):
+                raise TypeError("trajectory_postprocessor_kwargs must be a mapping")
             postprocessor_fqn = postprocessor_fqn.strip()
             trajectory_postprocessor = load_class_from_fqn(
                 postprocessor_fqn,
@@ -418,6 +417,7 @@ class OpenAICompatibleAgentFramework(AgentFramework):
         trajectories: list[Trajectory],
     ) -> list[Trajectory]:
         """Apply the optional sync/async postprocessor and validate its result."""
+        expected_reward_info = deepcopy(trajectories[-1].reward_info) if trajectories else {}
         result = self._trajectory_postprocessor(tuple(trajectories), **self._trajectory_postprocessor_kwargs)
         if inspect.isawaitable(result):
             result = await result
@@ -426,6 +426,8 @@ class OpenAICompatibleAgentFramework(AgentFramework):
             raise TypeError(f"trajectory postprocessor must return list[Trajectory], got {type(result).__name__}")
         if any(not isinstance(trajectory, Trajectory) for trajectory in result):
             raise TypeError("trajectory postprocessor returned a non-Trajectory item")
+        if any(trajectory.reward_info != expected_reward_info for trajectory in result):
+            raise ValueError("trajectory postprocessor must preserve finalized reward_info")
         return result
 
     def _build_session_sampling_params(

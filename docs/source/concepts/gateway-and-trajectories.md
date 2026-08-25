@@ -86,9 +86,10 @@ actor_rollout_ref:
 ```
 
 The FQN is imported when the Agent Framework starts, so it must be available in
-the AgentFrameworkWorker environment. Malformed FQN or keyword-argument values
-log a warning and leave the hook disabled. A valid non-empty FQN is loaded
-eagerly and must resolve to a callable with this contract:
+the AgentFrameworkWorker environment. A configured FQN must be a non-empty
+string, and `trajectory_postprocessor_kwargs` must be a mapping. Invalid
+explicit configuration, import failures, and non-callable targets fail during
+Framework initialization. The callable must follow this contract:
 
 ```python
 from uni_agent.gateway.session import Trajectory
@@ -108,10 +109,12 @@ def process_trajectories(
 
 `trajectory_postprocessor_kwargs` is passed as keyword arguments. The processor
 receives a tuple and must return `list[Trajectory]`; returning an empty list
-filters the session out. An `async def` processor is
-also supported and is awaited. Returned trajectories must keep
-their token arrays aligned because unfinished masking and TransferQueue
-materialization run later.
+filters the session out. An `async def` processor is also supported and is
+awaited. Returned trajectories must preserve the finalized session
+`reward_info` and keep their token arrays aligned because reward scoring,
+unfinished masking, and TransferQueue materialization run later. Use
+`dataclasses.replace` when constructing transformed trajectories so unrelated
+fields remain intact.
 
 `max_total_tokens` above is defined by the example processor.
 This compact example drops oversized trajectories; a processor that
