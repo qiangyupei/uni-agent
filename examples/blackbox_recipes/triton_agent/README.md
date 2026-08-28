@@ -2,7 +2,7 @@
 
 This example migrates the NPU operator task and training-trajectory behavior to
 the stock Uni-Agent Task, Sandbox, Gateway, and Claude Code APIs. It targets
-Uni-Agent `26a49e2646dfe2cb1caa668df2b112ed0afc3ad1` plus the `verl` v0.9.0
+Uni-Agent `3cbaecc4dc5175fbde61e6cb5d4336a75a7035e4` plus the `verl` v0.9.0
 submodule (`483b8a009ba3a97563edee3a19887e4862b8094a`). It intentionally contains no
 custom Gateway, KV-cache router, Megatron, checkpoint, debug, Claude protocol
 shim, or NPU-memory patches.
@@ -10,84 +10,103 @@ shim, or NPU-memory patches.
 See `MIGRATION.md` for the exact scope matrix, old/new behavior differences,
 NPU-memory audit, external blockers, and verification ledger.
 
-## Required core patches
+## Core patches
 
-Apply the three independent patches shipped under the repository-level
-`patches/` directory before running training:
+The intended best-prefix and reward-metadata behavior requires the first two
+patches under the repository-level `patches/` directory:
 
 1. the framework-level `trajectory_postprocessor_fqn` hook; and
-2. bounded, JSON-serializable `TaskResult.extra_info` reward forwarding plus
-   opt-in fail-closed reward delivery; and
-3. cancellation-safe, bounded Sandbox lifecycle cleanup with retryable
-   OpenYuanRong kill failure.
+2. bounded, JSON-serializable `TaskResult.extra_info` reward forwarding.
+
+For a production run, also stack:
+
+3. opt-in fail-closed reward delivery; and
+4. cancellation-safe, bounded Sandbox lifecycle cleanup.
 
 The hook is configured once in `run_train.sh` at
 `actor_rollout_ref.rollout.custom.agent_framework`. Built-in
 `trajectory_selection` remains `all`, so the pure recipe processor receives
 every materialized chain before scoring and TransferQueue writes.
-The lifecycle patch uses `SANDBOX_STOP_TIMEOUT`; `run_train.sh` defaults it to
-120 seconds. This is a local cleanup bound, not a provider TTL.
+The lifecycle patch reads `SANDBOX_STOP_TIMEOUT` in the Ray worker. Set it in
+`RUNTIME_ENV.env_vars` when overriding the patch default. The recipe's remote
+Docker provider also turns `sandbox.runtime_timeout` into a container TTL.
+Without patches 3 and 4, the healthy path still creates, reports, and destroys
+the sandbox, but reward POST failures remain best-effort and cancellation
+cleanup has the stock lifecycle boundary.
 
-This repository intentionally does not redistribute the benchmark payload or
-the CANN-licensed verifier/image assets. The included synthetic fixture tests
-the data and task schema, not an NPU rollout. A reviewed, digest-pinned image
-that satisfies the contract below is therefore a hard prerequisite, not an
-optional production refinement.
+This repository does not redistribute benchmark payloads or the numerical CANN
+verifier and latency tools. Install the reviewed legacy-compatible
+`verify_once.sh` flow in the sandbox image and retain its original licence
+notices. The included tests exercise agent-time metric selection and fallback,
+not an NPU rollout. A digest-pinned image remains a prerequisite.
 
 ## Runtime architecture
 
 Each rollout session invokes `TritonOperatorTask.run`. An attempt enters one
 `Sandbox` async context, stages its task, launches the existing
-`ClaudeCodeAgent`, performs one bounded final verification, optionally downloads
-small artifacts, and exits the context. When explicitly enabled, a missing
+`ClaudeCodeAgent`, stops remaining task processes, selects the metrics produced
+by agent-time verifier calls, optionally downloads small artifacts, and exits
+the context. It does **not** run correctness or latency verification again after
+Claude exits. When explicitly enabled, a missing
 implementation gets at most one retry in a newly created sandbox while
 retaining the same Gateway session; the first sandbox is fully destroyed before
 retry staging begins. The shipped config keeps this retry disabled until chain
 identity is qualified. Sandbox
 destruction is therefore the normal process/resource cleanup path on success,
-exceptions, cancellation, and retry. The remote provider must also configure a
-TTL/reaper for hard-killed Ray workers.
+exceptions, cancellation, and retry. The remote container runs
+`sleep <runtime_timeout>` as PID 1 with Docker `--rm`, providing a bounded
+fallback if a Ray worker is hard-killed.
 
-When OpenYuanRong cannot directly reach the per-session Gateway, the example's
-thin runner copies the task config, injects that session's `upstream` and
-`proxy_port`, and rewrites only Claude Code's URL to the in-sandbox tunnel.
-Reward reporting retains the original runner-side URL. Disable
-`SANDBOX_GATEWAY_TUNNEL` for providers with direct network reachability. These
-two tunnel kwargs are an OpenYuanRong provider contract, not a portable Sandbox
-API; another remote provider needs an equivalent example-local binding.
+The example-local `triton_remote_docker` provider subclasses Uni-Agent's stock
+`DockerSandbox`. The runner assigns each session to one configured Docker
+endpoint, then the inherited lifecycle performs `docker run`, `exec`, `cp`, and
+`rm -f` through `docker --host`. The default deployment uses Docker over SSH and
+direct LAN access to the per-session Gateway; it does not use an OpenYuanRong
+reverse tunnel. The Gateway must advertise an address reachable from every
+sandbox host. Multi-host assignment is a stable hash, not a capacity-aware
+scheduler or failover layer; remove unhealthy endpoints before a run or point
+the recipe at an independently operated Docker-compatible control plane.
 
 The stock Gateway reward endpoint is not authenticated. The task runner uses
-the core patch's `reward_post_strict=True`, so a failed trusted final POST aborts
+the strict reward-delivery patch's `reward_post_strict=True`, so a failed runner-side reward POST aborts
 the session instead of consuming an earlier value, but fail-closed delivery is
 not endpoint authentication. Before any real training, give the runner a
 runner-only reward capability or enforce a network proxy/ACL that exposes only
 this session's `/v1/messages` route to the sandbox and denies direct Gateway
-reachability. The raw OpenYuanRong host/port tunnel does not prove that property
-by itself. Reward-endpoint isolation is a hard deployment gate; this recipe
+reachability. Direct Docker-host networking does not prove that property.
+Reward-endpoint isolation is a hard deployment gate; this recipe
 does not reintroduce the explicitly excluded Gateway changes.
 
 One sandbox is not automatically one NPU. This recipe makes exclusivity
 executable: the runner injects a reviewed device list and lock location, and
-both agent-time and final verifier commands must enter the root-owned
+every supported agent-time verifier command must enter the root-owned
 `with_npu_lease.py` wrapper. The wrapper takes an advisory lock, sets Ascend
 device-visibility variables, runs the verifier in its own process group, and
 keeps the lock FD inherited so an uncatchably killed wrapper cannot release a
 device still used by its child. Keep evaluator NPUs separate from
-training/rollout NPUs and enforce
-`MAX_CONCURRENT_SESSIONS <= EVALUATOR_NPU_COUNT`.
+training/rollout devices. Session/container concurrency is intentionally
+independent of the NPU count: several live Claude sessions may share a host,
+while verifier calls wait for a device lock. Waiting for a lock consumes the
+session's agent time budget, so tune `MAX_CONCURRENT_SESSIONS` to both Docker
+capacity and expected verifier contention.
 
-The lock directory must be a genuinely shared mount for every sandbox that can
-reach the same physical-device namespace. Pre-create root-owned mode-0666
-`device-<id>.lock` files in a root-owned sticky directory; the wrapper refuses
-to create or trust agent-owned locks. A host-local device-ID namespace needs a
-host-local shared mount, while a remote multi-host scheduler needs an equivalent
-provider binding. The wrapper's `--check` cannot prove that two containers see
-the same inode, so concurrent integration testing remains mandatory.
+All remote Docker hosts are expected to expose the same configured device IDs.
+`EVALUATOR_NPU_COUNT` is therefore the per-host list length; the launcher's
+default session cap is that value times the number of configured hosts.
+The runner mounts `EVALUATOR_NPU_LOCK_DIR` from the selected daemon host at the
+same path in each container. Containers on one physical host therefore share
+that host's device pool; different hosts use independent local files even when
+their device IDs match. Do not place this directory on global NFS. Pre-create
+root-owned mode-0666 `device-<id>.lock` files in a root-owned sticky directory;
+the wrapper refuses to create or trust agent-owned locks. Its `--check` cannot
+prove that two containers see the same backing inode, so concurrent integration
+testing remains mandatory.
 
 ## Sandbox image contract
 
-`config/task_config.yaml` expects the image to declare `WORKDIR /workspace`, the
-provider `cwd` to remain `/workspace`, and `/opt/triton-agent-template` to
+`config/task_config.yaml` expects every remote daemon to have the pinned image,
+the image to declare `WORKDIR /workspace`, the provider `cwd` to remain
+`/workspace`, and `/opt/triton-agent-template` to
 contain reviewed, redistributable assets. Replace its deliberately invalid
 `REPLACE_WITH_PINNED_TRITON_AGENT_NPU_IMAGE_DIGEST` value with an immutable
 reviewed digest. Every attempt runs `pwd` without a
@@ -105,92 +124,95 @@ The template contains:
 - `INSTRUCTIONS.md`;
 - `tools/verify_once.sh`, a symlink to the immutable image command below;
 - protected verifier code and image-owned test inputs; and
-- the pinned Claude Code CLI (the stock agent can install it, but a pinned image
-  is reproducible and avoids runtime internet access).
+- a pinned Claude Code CLI release supporting `PostToolUseFailure` and universal
+  `continue: false` hook output (the stock agent can install Claude, but a pinned
+  image is reproducible and avoids runtime internet access).
 
 The image must separately provide immutable, root-owned executables outside the
 agent workspace:
 
 - `/opt/triton-agent-tools/cleanup_task_processes.sh`, scoped to the session
-  cgroup/PIDs and required both immediately before final verification and in the
-  attempt's `finally` cleanup;
-- `/opt/triton-agent-tools/final_verify.sh`, which uses protected inputs,
-  independently recompiles/runs the selected implementation, and replaces the
-  final verifier JSON;
+  cgroup/PIDs and required both immediately before final artifact selection and
+  in the attempt's `finally` cleanup;
 - `/opt/triton-agent-tools/verify_once.sh`, accepting one safe operator name
-  and invoking `with_npu_lease.py` before any NPU work; and
+  and implementing the retained agent-time stage, correctness, benchmark, and
+  best-snapshot flow; and
 - `/opt/triton-agent-tools/with_npu_lease.py`, built from the reviewed recipe
-  asset and installed root-owned/non-writable.
+  asset, installed root-owned/non-writable, and invoked by `verify_once.sh`
+  before any NPU work.
 
-Before Claude starts, the task resolves the workspace `tools/verify_once.sh`
-symlink and requires that it point exactly to the trusted image command. This
-preflight plus the native transcript hook verifies the supported agent-time
-path; the deployment should still deny direct unleased device access where its
-container/runtime supports that policy.
+The shipped Docker `run_args` mirror the old Ascend deployment's privileged
+device and driver mounts. Adjust host paths to the qualified cluster image and
+verify every bind source exists on every daemon host before rollout.
+Because privileged containers can bypass an advisory file lock and access a
+device directly, this is a cooperative resource-sharing contract, not a
+security boundary against malicious task code.
 
-Task-specific reference code and sidecars necessarily enter the agent-visible
-workspace; chmod alone is not a trust boundary. After the agent exits and
-required process cleanup succeeds, the runner atomically overwrites every
-reference/sidecar plus `TASK_METADATA.json` from original sample metadata and
-records an expected SHA-256 manifest. It removes the complete agent-controlled
-`output` subtree without following a symlink argument, recreates
-`output/verify`, runs the trusted verifier, requires process cleanup again, then
-re-hashes every input. Any post-reset change forces reward to zero. Runner-side
-reads accept only bounded regular non-symlink files; verifier JSON is limited to
-1 MiB and implementation files to 2 MiB, with a bounded remote read.
+The image-owned `verify_once.sh` must preserve the previous execution contract:
 
-The verifier should produce:
+1. stage the current implementation in `output/verify`;
+2. run correctness under the NPU lease;
+3. run the latency benchmark only after full correctness; and
+4. when the rank improves, update `metrics_best.json` and
+   `src/<op>_triton_ascend_impl_best.py` as one logical snapshot. The best
+   metrics must include the numeric `reward` used by correctness early-stop.
 
-- `output/verify/verify_result.json` with case totals, compile status,
-  `verified_impl_path`, and `verified_impl_sha256`;
-- `output/verify/perf_result.json` with a finite nonnegative speedup plus the
-  same `verified_impl_path` and `verified_impl_sha256` when benchmarking
-  succeeds;
-- optionally `verify_result_summary.json`.
+Before Claude starts, the Task resolves the workspace `tools/verify_once.sh`
+symlink and requires it to point exactly to the immutable image command. The
+deployment should still deny direct unleased device access where its runtime
+supports that policy.
 
-The trusted orchestrator must not import or execute candidate code in the same
-interpreter/security context that writes those attestations. Run the candidate
-in a child process or stronger namespace that cannot write verifier outputs or
-modify the harness, wait for all candidate descendants to exit, and have the
-root-owned trusted parent atomically create the final JSON. Every transitive
-harness dependency and protected case input must likewise be image-owned and
-non-writable. Candidate-written attestation JSON is untrusted even when its
-claimed implementation digest happens to match.
+After Claude exits, required process cleanup makes the workspace quiescent and
+the Task selects results in the same order as the previous training code:
 
-Exit code zero means the evaluation and attestation infrastructure completed,
-not that every correctness case passed. Partial case failure must be represented
-by consistent counts while still returning zero so the preserved partial-credit
-reward can be computed. A nonzero exit is treated as an infrastructure failure
-and forces reward to zero. Boolean fields must be JSON booleans, not strings;
-non-finite JSON constants and performance values are rejected.
+1. a substantive best implementation paired with `metrics_best.json`;
+2. otherwise, `output/verify/verify_result.json`, optional
+   `verify_result_summary.json`/`perf_result.json`, and the staged implementation
+   are used to recover a best pair;
+3. otherwise, a substantive current implementation paired with `metrics.json`;
+4. otherwise, the attempt reports missing implementation or missing metrics.
 
-The attested path must be exactly the current or best implementation filename,
-and its SHA-256 must match bytes read back by the task. Otherwise reward is
-forced to zero. The verifier must also report `total_cases > 0` and internally
-consistent passed/failed totals. Agent-writable
-`metrics.json`/`metrics_best.json` never supplies reward numbers; only trusted
-final verifier outputs do. The paired
-`metrics_best.json` and best implementation can supply only the experimental
-assistant-turn hint described below; the training default does not consume it.
+The Task rejects oversized, malformed, non-finite, or symlink artifact files and
+checks implementation shape and available snapshot digests. Serialized reward
+fields in the workspace are ignored: `reward.py` recomputes
+AST/compile/correctness/speedup components from the selected raw metrics, and a
+full pass is represented by pass rate one rather than a separate bonus.
 
-The task installs project-local Claude Code `PreToolUse` and `PostToolUse` hooks
-using the native Bash hook API. Only a command containing
-`tools/verify_once.sh` is observed. The pre-hook counts unique assistant messages
-from the provided `transcript_path` and fingerprints the existing best pair;
-the post-hook annotates `metrics_best.json` only if both best files exist and
-both contents changed. The task rechecks the recorded best-implementation
-SHA-256 before forwarding `train_best`, preventing a stale assistant index
-after final verification. This does not make the scalar index trusted: the
-hook state is agent-writable and has no Gateway chain identity. Consequently,
-`run_train.sh` defaults to `selection=all_final`. `selection=best` is an
-explicit experiment only after a runner/Gateway-owned snapshot identity is
-available; even then, multiple chains fall back to each legal final prefix.
+This is deliberately the legacy trust model. The implementation, verifier JSON,
+`metrics.json`, and `metrics_best.json` all remain writable by the agent. A
+matching digest, timestamp, or best pair detects accidental mismatch but cannot
+authenticate case counts or latency because the agent can rewrite both sides.
+There is no runner-owned trust proof, and the Task does not invoke the evaluator
+after Claude exits. Use this recipe only where that tradeoff is accepted;
+restoring trusted reward would require a runner/provider-owned verifier boundary
+rather than treating these checks as one.
 
-Unlike the old protocol shim, stock `ClaudeCodeAgent` does not expose stream
-events for runner-side verifier polling or a hard verifier-patience early stop.
-The migration uses native hook input only for snapshot alignment and relies on
-`max_turns`/`run_timeout`; there is no repair-round loop. Details are recorded in
-`MIGRATION.md`.
+The task installs project-local Claude Code `PreToolUse`, `PostToolUse`, and
+`PostToolUseFailure` hooks for Bash. Only commands containing
+`tools/verify_once.sh` are observed. The pre-hook counts unique assistant
+messages and fingerprints the best pair. After either a successful or failed
+verifier call, the post-hook binds a changed implementation to the current
+assistant turn; a better remeasurement of unchanged implementation bytes keeps
+the previous binding. The Task rechecks that binding against the selected best
+implementation before forwarding `train_best`.
+
+The same post-hook implements the two old patience phases. Before full
+correctness, it stops after 7 consecutive verifier calls without a best update,
+provided the best reward is at least 0.15. After full correctness, it stops
+after 3 consecutive calls without a latency improvement. Configure these with
+`verify_early_stop_patience`, `verify_early_stop_min_reward`, and
+`latency_optimize_patience`; a patience of zero disables that phase. At the
+threshold the hook returns Claude Code's native `continue: false`, so this is a
+cooperative agent stop rather than an OS process kill. A valid stop marker plus
+a digest-checked `train_best` is treated as a finished episode; `run_timeout=9000`
+remains the outer wall-clock bound.
+
+`run_train.sh` now requests `selection=best`. A single finalized trajectory is
+cropped to the recorded assistant boundary; multiple Gateway chains still use
+`best_fallback=all_final` because the scalar hook index has no chain identity.
+The hook state and numerical metrics remain agent-writable under this recipe's
+documented legacy trust model, and there is still no runner-side protocol shim,
+hard kill, or repair-round loop. Details are recorded in `MIGRATION.md`.
 
 If `retry_on_missing_impl` is opted in, the second fresh-sandbox attempt creates
 a new Gateway chain without private abort/create/reset APIs. Reward metadata
@@ -287,8 +309,32 @@ bash examples/blackbox_recipes/triton_agent/prepare_synthetic.sh
 
 ## Training
 
-Start from the official NPU VeOmni/vLLM-Ascend environment, set the model and
-exclusive evaluator capacity, then append cluster/model parallelism overrides:
+First prepare each homogeneous remote NPU host. The bind-mount source below is
+resolved by that host's Docker daemon, so repeat it independently on every
+host:
+
+```bash
+sudo install -d -o root -g root -m 1777 /var/lock/triton-agent-npu
+for device in 0 1 2 3 4 5 6 7; do
+  sudo touch "/var/lock/triton-agent-npu/device-${device}.lock"
+  sudo chown root:root "/var/lock/triton-agent-npu/device-${device}.lock"
+  sudo chmod 0666 "/var/lock/triton-agent-npu/device-${device}.lock"
+done
+docker pull <reviewed-image@sha256:digest>
+```
+
+Configure Docker-over-SSH access from every Ray node that may execute an Agent
+Runner, and verify it before training:
+
+```bash
+docker --host ssh://sandbox-user@npu-host-01 info
+```
+
+Do not expose an unauthenticated Docker TCP daemon. SSH keys, host keys, and any
+TLS credentials should be provisioned outside Hydra arguments and logs.
+
+Then start from the official NPU VeOmni/vLLM-Ascend environment, set the model
+and remote evaluator pool, and append cluster/model parallelism overrides:
 
 `RUNTIME_ENV` must make this repository importable on every Ray worker, either
 with a reviewed `working_dir`/package upload or by installing the exact recipe
@@ -297,10 +343,22 @@ Parquet files, model paths, and runner-local artifact destinations resolve
 consistently across nodes; a driver-only checkout is insufficient for
 `dispatch_mode=ray_task`.
 
+Environment consumed inside Agent Runner tasks must also be declared in that
+runtime-env file; setting it only on the `ray job submit` entrypoint does not
+reliably propagate it to Ray workers. For example:
+
+```yaml
+env_vars:
+  SANDBOX_STARTUP_CONCURRENCY: "32"
+  SANDBOX_STOP_TIMEOUT: "120"
+  # GPU deployments may also pin VERL_PLATFORM: nvidia here.
+```
+
 ```bash
 MODEL_PATH=/models/Qwen3-Coder-30B-A3B-Instruct \
 TRAIN_FILE=/data/triton-agent/train.parquet \
 VAL_FILE=/data/triton-agent/validation.parquet \
+REMOTE_DOCKER_HOSTS=ssh://sandbox-user@npu-host-01,ssh://sandbox-user@npu-host-02 \
 EVALUATOR_NPU_COUNT=8 \
 EVALUATOR_NPU_DEVICE_IDS=0,1,2,3,4,5,6,7 \
 EVALUATOR_NPU_LOCK_DIR=/var/lock/triton-agent-npu \
@@ -308,6 +366,22 @@ MAX_CONCURRENT_SESSIONS=8 \
 bash examples/blackbox_recipes/triton_agent/run_train.sh \
   actor_rollout_ref.actor.optim.lr=5e-7
 ```
+
+For NVIDIA training/rollout with the same remote Ascend verifier pool, use the
+stock verl 0.9 Megatron/V1 synchronous launcher:
+
+```bash
+REMOTE_DOCKER_HOSTS=ssh://sandbox-user@npu-host-01,ssh://sandbox-user@npu-host-02 \
+EVALUATOR_NPU_DEVICE_IDS=0,1,2,3,4,5,6,7 \
+MODEL_PATH=/models/Qwen3-Coder-30B-A3B-Instruct \
+bash examples/blackbox_recipes/triton_agent/run_train_gpu.sh
+```
+
+`run_train_gpu.sh` changes only the training/rollout backend to NVIDIA
+Megatron/vLLM. It deliberately omits the legacy fork's custom Megatron memory,
+Gateway, KV-routing, checkpoint, debug, and Claude shim changes. Put cluster
+specific NCCL, NIC, CUDA allocator, and vLLM environment variables in
+`RUNTIME_ENV`.
 
 Pin a verl-0.9-supported model, CANN, torch/torch-npu, Triton Ascend, vLLM,
 vLLM-Ascend, Claude Code, and sandbox image digest. This recipe makes no claim
@@ -322,8 +396,8 @@ old Megatron-only optimizations; validate peak memory and reduce scale first.
 > advantage estimator. An all-empty prompt must be resampled or fail the run;
 > never pad it with an invalid/no-op trajectory.
 
-The default processor policy is `all_final`; agent-writable best-turn hints do
-not alter credit assignment. The processor validates exact
+The processor function itself defaults to `all_final`, while the training
+launcher explicitly selects `best`. The processor validates exact
 `response_ids`/`response_mask`/logprob alignment,
 crops only on assistant boundaries, clears stale generation-step metadata and
 routing captures, and recomputes the assistant-ending turn count. It never maps
@@ -343,11 +417,13 @@ destruction; file size and download time are bounded.
 python -m ruff check examples/blackbox_recipes/triton_agent
 python -m pytest -q examples/blackbox_recipes/triton_agent/tests
 bash -n examples/blackbox_recipes/triton_agent/run_train.sh
+bash -n examples/blackbox_recipes/triton_agent/run_train_gpu.sh
 ```
 
 The unit suite covers stable IDs and split leakage, reward normalization,
-sandbox lifecycle, trusted-input reset/attestation, tunnel and NPU-lease config,
-token-array alignment, assistant-boundary crops, best-prefix selection, and
-explicit empty policies. Before upstreaming, also run one real NPU
+sandbox lifecycle, legacy metric selection/fallback, transcript binding,
+two-phase early-stop, remote Docker and NPU-lease config, token-array alignment,
+assistant-boundary crops, best-prefix selection, and explicit empty policies.
+Before upstreaming, also run one real NPU
 verify/benchmark, concurrent device isolation tests, a real Gateway multi-chain
 rollout, and a one-step VeOmni train.

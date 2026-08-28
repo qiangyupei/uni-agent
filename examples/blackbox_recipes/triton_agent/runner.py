@@ -3,7 +3,7 @@
 The adapter has two intentionally small responsibilities:
 
 * import :mod:`task` so the example-local task is registered; and
-* optionally bind an OpenYuanRong sandbox tunnel to the live Gateway session.
+* bind this session to a remote Docker host.
 
 Task construction, reward reporting, and ``TaskResult.extra_info`` validation
 remain owned by :func:`uni_agent.framework.task_runner.run_task`.
@@ -18,8 +18,9 @@ from uni_agent.framework.task_runner import run_task
 if TYPE_CHECKING:
     from uni_agent.gateway.session import SessionHandle
 
+from . import remote_docker as _remote_docker  # noqa: F401 - registers the recipe provider
 from . import task as _task  # noqa: F401 - import registers ``triton_operator``
-from .network import bind_gateway_tunnel, bind_npu_lease, parse_device_ids
+from .network import bind_remote_sandbox, parse_device_ids
 
 
 async def run_triton_task(
@@ -28,9 +29,8 @@ async def run_triton_task(
     tools_kwargs: dict[str, Any] | None = None,
     raw_prompt: Any = None,
     sample_index: int | None = None,
-    sandbox_gateway_tunnel: bool = False,
-    sandbox_gateway_proxy_port: int = 38197,
-    evaluator_npu_device_ids: str | None = None,
+    remote_docker_hosts: str,
+    evaluator_npu_device_ids: str,
     evaluator_npu_lock_dir: str = "/var/lock/triton-agent-npu",
     evaluator_npu_lock_timeout: float = 1200.0,
     reward_post_strict: bool = True,
@@ -38,9 +38,15 @@ async def run_triton_task(
 ):
     """Run one Triton task through Uni-Agent's generic Task runner."""
 
-    import copy
-
-    copied = copy.deepcopy(tools_kwargs or {})
+    devices = parse_device_ids(evaluator_npu_device_ids)
+    copied = bind_remote_sandbox(
+        tools_kwargs or {},
+        hosts=remote_docker_hosts,
+        session_id=session.session_id,
+        devices=devices,
+        lock_dir=evaluator_npu_lock_dir,
+        lock_timeout=evaluator_npu_lock_timeout,
+    )
     task_config = copied.get("task")
     if not isinstance(task_config, dict):
         raise ValueError("run_triton_task requires tools_kwargs['task']")
@@ -52,26 +58,10 @@ async def run_triton_task(
         raise TypeError("tools_kwargs['task']['metadata']['runtime'] must be a mapping")
     runtime.update({"session_id": session.session_id, "sample_index": sample_index})
 
-    if evaluator_npu_device_ids:
-        devices = parse_device_ids(evaluator_npu_device_ids)
-        runtime["evaluator_npu_device_count"] = len(devices)
-        copied = bind_npu_lease(
-            copied,
-            device_ids=evaluator_npu_device_ids,
-            lock_dir=evaluator_npu_lock_dir,
-            lock_timeout=evaluator_npu_lock_timeout,
-        )
-
-    bound_session = session
-    if sandbox_gateway_tunnel:
-        bound_session, copied = bind_gateway_tunnel(
-            session,
-            copied,
-            proxy_port=sandbox_gateway_proxy_port,
-        )
+    runtime["evaluator_npu_device_count"] = len(devices)
 
     return await run_task(
-        session=bound_session,
+        session=session,
         tools_kwargs=copied,
         raw_prompt=raw_prompt,
         sample_index=sample_index,

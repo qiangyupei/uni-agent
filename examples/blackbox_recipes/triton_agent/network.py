@@ -1,44 +1,14 @@
-"""Provider-specific, copy-on-write Gateway tunnel binding."""
+"""Copy-on-write bindings for the recipe's remote evaluator sandbox."""
 
 from __future__ import annotations
 
 import copy
+import hashlib
 import math
-from dataclasses import replace
-from typing import TYPE_CHECKING, Any
-from urllib.parse import urlsplit, urlunsplit
-
-if TYPE_CHECKING:
-    from uni_agent.gateway.session import SessionHandle
+from typing import Any
 
 
-def bind_gateway_tunnel(
-    session: SessionHandle,
-    tools_kwargs: dict[str, Any],
-    *,
-    proxy_port: int,
-) -> tuple[SessionHandle, dict[str, Any]]:
-    """Return copies configured for an OpenYuanRong per-sandbox tunnel.
-
-    ``reward_info_url`` is deliberately left unchanged: reward reporting runs
-    in the Ray task process, whereas only Claude Code runs inside the sandbox.
-    """
-
-    if not session.base_url:
-        raise ValueError("sandbox_gateway_tunnel requires session.base_url")
-    if not 1 <= proxy_port <= 65535:
-        raise ValueError(f"invalid sandbox gateway proxy port: {proxy_port}")
-
-    parsed = urlsplit(session.base_url)
-    if parsed.scheme not in {"http", "https"} or not parsed.hostname or parsed.port is None:
-        raise ValueError(f"Gateway URL must contain an http(s) host and port: {session.base_url!r}")
-    if parsed.username or parsed.password:
-        raise ValueError("Gateway URL credentials cannot be forwarded as a sandbox upstream")
-
-    upstream_host = f"[{parsed.hostname}]" if ":" in parsed.hostname else parsed.hostname
-    upstream = f"{upstream_host}:{parsed.port}"
-    internal_url = urlunsplit(("http", f"127.0.0.1:{proxy_port}", parsed.path, parsed.query, ""))
-
+def _copy_sandbox_kwargs(tools_kwargs: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
     copied = copy.deepcopy(tools_kwargs)
     task_config = copied.get("task")
     if not isinstance(task_config, dict):
@@ -49,10 +19,7 @@ def bind_gateway_tunnel(
     sandbox_kwargs = sandbox_config.setdefault("sandbox_kwargs", {})
     if not isinstance(sandbox_kwargs, dict):
         raise TypeError("tools_kwargs['task']['sandbox']['sandbox_kwargs'] must be a mapping")
-    sandbox_kwargs["upstream"] = upstream
-    sandbox_kwargs["proxy_port"] = proxy_port
-
-    return replace(session, base_url=internal_url), copied
+    return copied, sandbox_kwargs
 
 
 def parse_device_ids(value: str) -> tuple[str, ...]:
@@ -67,28 +34,27 @@ def parse_device_ids(value: str) -> tuple[str, ...]:
     return devices
 
 
-def bind_npu_lease(
+def bind_remote_sandbox(
     tools_kwargs: dict[str, Any],
     *,
-    device_ids: str,
+    hosts: str,
+    session_id: str,
+    devices: tuple[str, ...],
     lock_dir: str,
     lock_timeout: float,
 ) -> dict[str, Any]:
-    """Copy sample config and inject the image-owned evaluator lease contract."""
+    """Copy sample config and bind its Docker host and NPU lease contract."""
 
-    devices = parse_device_ids(device_ids)
+    docker_hosts = tuple(part.strip() for part in hosts.split(","))
+    if not docker_hosts or any(not part for part in docker_hosts):
+        raise ValueError("remote_docker_hosts cannot contain empty entries")
     if not math.isfinite(lock_timeout) or lock_timeout <= 0:
         raise ValueError("evaluator_npu_lock_timeout must be finite and positive")
-    copied = copy.deepcopy(tools_kwargs)
-    task_config = copied.get("task")
-    if not isinstance(task_config, dict):
-        raise ValueError("run_triton_task requires tools_kwargs['task']")
-    sandbox_config = task_config.setdefault("sandbox", {})
-    if not isinstance(sandbox_config, dict):
-        raise TypeError("tools_kwargs['task']['sandbox'] must be a mapping")
-    sandbox_kwargs = sandbox_config.setdefault("sandbox_kwargs", {})
-    if not isinstance(sandbox_kwargs, dict):
-        raise TypeError("tools_kwargs['task']['sandbox']['sandbox_kwargs'] must be a mapping")
+
+    slot = int.from_bytes(hashlib.sha256(session_id.encode()).digest()[:8], "big") % len(docker_hosts)
+    copied, sandbox_kwargs = _copy_sandbox_kwargs(tools_kwargs)
+    sandbox_kwargs["docker_host"] = docker_hosts[slot]
+    sandbox_kwargs["npu_lock_dir"] = lock_dir
     env = sandbox_kwargs.setdefault("env", {})
     if not isinstance(env, dict):
         raise TypeError("sandbox_kwargs.env must be a mapping")

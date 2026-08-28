@@ -6,11 +6,10 @@ import math
 from typing import Any
 
 DEFAULT_REWARD_WEIGHTS: dict[str, float] = {
-    "ast": 0.0,
-    "compile": 0.10,
-    "correctness": 0.55,
-    "all_correct_bonus": 0.10,
-    "speedup": 0.40,
+    "ast": 0.05,
+    "compile": 0.25,
+    "correctness": 0.40,
+    "speedup": 0.30,
     "target_speedup": 2.0,
 }
 
@@ -107,22 +106,20 @@ def reward_breakdown(
 
     configured = {**DEFAULT_REWARD_WEIGHTS, **(weights or {})}
     pass_rate = min(1.0, max(0.0, _as_float(metrics.get("pass_rate"))))
-    correctness_ok = bool(metrics.get("correctness_ok"))
+    correctness_ok = metrics.get("correctness_ok") is True
     ast_score = configured["ast"] if metrics.get("ast_check_ok") else 0.0
     compile_score = configured["compile"] if metrics.get("compile_ok") else 0.0
     correctness_score = configured["correctness"] * pass_rate
-    all_correct_score = configured["all_correct_bonus"] if correctness_ok else 0.0
     speedup = _speedup(metrics)
     target = max(configured["target_speedup"], 1e-9)
     speedup_score = 0.0
     if speedup > 0 and (correctness_ok or pass_rate > 0):
         speedup_score = configured["speedup"] * min(speedup / target, 1.0) * pass_rate
-    total = max(0.0, ast_score + compile_score + correctness_score + all_correct_score + speedup_score)
+    total = max(0.0, ast_score + compile_score + correctness_score + speedup_score)
     return {
         "ast": round(ast_score, 4),
         "compile": round(compile_score, 4),
         "correctness": round(correctness_score, 4),
-        "all_correct_bonus": round(all_correct_score, 4),
         "speedup": round(speedup_score, 4),
         "raw_speedup": round(speedup, 4),
         "total": round(total, 4),

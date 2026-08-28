@@ -1,14 +1,14 @@
 """Pure trajectory selection/cropping used by the framework hook PR.
 
-The public entry point intentionally depends only on finalized ``Trajectory``
-values and the hook's read-only context. It does not reach back into the
-framework, Gateway, tokenizer, or environment variables.
+The public entry point depends only on finalized ``Trajectory`` values and
+explicit policy arguments. It does not reach back into the framework, Gateway,
+tokenizer, or environment variables.
 """
 
 from __future__ import annotations
 
 import logging
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any
 
@@ -25,13 +25,20 @@ _STALE_AFTER_CROP = {
 
 
 def process_trajectories(
-    trajectories: Sequence[Trajectory],
+    trajectories: tuple[Trajectory, ...],
     *,
-    context: Any,
+    selection: str = "all_final",
+    best_fallback: str = "all_final",
+    best_requires_correctness: bool = False,
+    max_total_tokens: int | None = None,
+    drop_no_impl: bool = True,
+    discard_pre_retry: bool = True,
+    alignment_error: str = "raise",
+    empty_policy: str = "drop",
 ) -> list[Trajectory]:
     """Select trainable assistant-boundary prefixes for one session.
 
-    ``context.options`` supports:
+    Policy arguments:
 
     * ``selection``: ``all_final`` (default), ``best``, or ``final``;
     * ``best_fallback``: policy used when no valid assistant index is reported;
@@ -41,18 +48,17 @@ def process_trajectories(
     * ``alignment_error``: ``raise`` (default) or ``drop``;
     * ``empty_policy``: ``drop`` (session failure), ``keep_last``, or ``raise``.
 
-    The function never mutates the source trajectories or the hook context.
+    The function never mutates the source trajectories.
     """
 
     source = list(trajectories)
     if not source:
         return []
-    options = _options(context)
-    selection = str(options.get("selection", "all_final"))
-    best_fallback = str(options.get("best_fallback", "all_final"))
-    alignment_error = str(options.get("alignment_error", "raise"))
-    empty_policy = str(options.get("empty_policy", "drop"))
-    max_total_tokens = _optional_positive_int(options.get("max_total_tokens"), "max_total_tokens")
+    selection = str(selection)
+    best_fallback = str(best_fallback)
+    alignment_error = str(alignment_error)
+    empty_policy = str(empty_policy)
+    max_total_tokens = _optional_positive_int(max_total_tokens, "max_total_tokens")
 
     _choice(selection, "selection", {"best", "all_final", "final"})
     _choice(best_fallback, "best_fallback", {"all_final", "final", "drop"})
@@ -60,14 +66,12 @@ def process_trajectories(
     _choice(empty_policy, "empty_policy", {"drop", "keep_last", "raise"})
 
     reward_info = source[-1].reward_info if isinstance(source[-1].reward_info, dict) else {}
-    if _as_bool(options.get("drop_no_impl", True)) and (
-        reward_info.get("no_impl_retry_filter") or reward_info.get("no_impl_retry_failed")
-    ):
+    if _as_bool(drop_no_impl) and (reward_info.get("no_impl_retry_filter") or reward_info.get("no_impl_retry_failed")):
         return _on_empty(source, empty_policy, "no implementation produced")
 
     indexed = list(enumerate(source))
     if (
-        _as_bool(options.get("discard_pre_retry", True))
+        _as_bool(discard_pre_retry)
         and reward_info.get("no_impl_retry_used")
         and reward_info.get("no_impl_retry_discard_previous")
     ):
@@ -104,7 +108,7 @@ def process_trajectories(
                 valid,
                 reward_info,
                 max_total_tokens,
-                requires_correctness=_as_bool(options.get("best_requires_correctness", False)),
+                requires_correctness=_as_bool(best_requires_correctness),
             )
             if selected is None:
                 selected = _select_by_policy(valid, best_fallback, max_total_tokens)
@@ -265,13 +269,6 @@ def _on_empty(source: list[Trajectory], policy: str, reason: str) -> list[Trajec
         raise ValueError(f"trajectory postprocessing produced an empty session: {reason}")
     logger.warning("trajectory postprocessor kept the last unmodified trajectory: %s", reason)
     return [source[-1]]
-
-
-def _options(context: Any) -> Mapping[str, Any]:
-    options = context.get("options", {}) if isinstance(context, Mapping) else getattr(context, "options", {})
-    if not isinstance(options, Mapping):
-        raise TypeError("trajectory postprocessor context.options must be a mapping")
-    return options
 
 
 def _choice(value: str, name: str, allowed: set[str]) -> None:
