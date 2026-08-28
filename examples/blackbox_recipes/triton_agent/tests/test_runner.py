@@ -6,7 +6,7 @@ from dataclasses import dataclass
 import pytest
 
 from .. import runner as runner_module
-from ..network import bind_gateway_tunnel, bind_npu_lease, parse_device_ids
+from ..network import bind_remote_sandbox, parse_device_ids
 
 
 @dataclass
@@ -16,30 +16,13 @@ class SessionHandle:
     reward_info_url: str | None = None
 
 
-def test_gateway_tunnel_binding_is_copy_on_write() -> None:
-    session = SessionHandle(
-        "session-1",
-        base_url="http://10.0.0.4:8000/sessions/session-1/v1",
-        reward_info_url="http://10.0.0.4:8000/sessions/session-1/reward_info",
-    )
-    tools = {"task": {"name": "triton_operator", "metadata": {}}}
-    bound, copied = bind_gateway_tunnel(session, tools, proxy_port=38197)
-
-    assert session.base_url == "http://10.0.0.4:8000/sessions/session-1/v1"
-    assert bound.base_url == "http://127.0.0.1:38197/sessions/session-1/v1"
-    assert bound.reward_info_url == session.reward_info_url
-    assert copied["task"]["sandbox"]["sandbox_kwargs"] == {
-        "upstream": "10.0.0.4:8000",
-        "proxy_port": 38197,
-    }
-    assert "sandbox" not in tools["task"]
-
-
 def test_runner_injects_shared_npu_lease_environment() -> None:
     tools = {"task": {"name": "triton_operator", "metadata": {}}}
-    copied = bind_npu_lease(
+    copied = bind_remote_sandbox(
         tools,
-        device_ids="0,2",
+        hosts="ssh://sandbox-a",
+        session_id="session-1",
+        devices=("0", "2"),
         lock_dir="/shared/npu-locks",
         lock_timeout=45,
     )
@@ -50,6 +33,26 @@ def test_runner_injects_shared_npu_lease_environment() -> None:
         "TRITON_EVAL_LOCK_DIR": "/shared/npu-locks",
         "TRITON_EVAL_LOCK_TIMEOUT": "45",
     }
+    assert copied["task"]["sandbox"]["sandbox_kwargs"]["npu_lock_dir"] == "/shared/npu-locks"
+    assert "sandbox" not in tools["task"]
+
+
+def test_remote_docker_binding_is_stable_and_copy_on_write() -> None:
+    tools = {"task": {"name": "triton_operator", "metadata": {}}}
+
+    kwargs = {
+        "hosts": "ssh://sandbox-a,ssh://sandbox-b",
+        "session_id": "session-1",
+        "devices": ("0",),
+        "lock_dir": "/shared/npu-locks",
+        "lock_timeout": 45,
+    }
+    first = bind_remote_sandbox(tools, **kwargs)
+    second = bind_remote_sandbox(tools, **kwargs)
+
+    first_host = first["task"]["sandbox"]["sandbox_kwargs"]["docker_host"]
+    assert first_host in {"ssh://sandbox-a", "ssh://sandbox-b"}
+    assert second["task"]["sandbox"]["sandbox_kwargs"]["docker_host"] == first_host
     assert "sandbox" not in tools["task"]
 
 
@@ -62,9 +65,11 @@ def test_device_parser_rejects_empty_entries(value: str) -> None:
 @pytest.mark.parametrize("timeout", [0.0, -1.0, float("nan"), float("inf")])
 def test_npu_lease_rejects_non_positive_or_non_finite_timeout(timeout: float) -> None:
     with pytest.raises(ValueError, match="finite and positive"):
-        bind_npu_lease(
+        bind_remote_sandbox(
             {"task": {"name": "triton_operator"}},
-            device_ids="0",
+            hosts="ssh://sandbox-a",
+            session_id="session-1",
+            devices=("0",),
             lock_dir="/shared/npu-locks",
             lock_timeout=timeout,
         )
@@ -87,6 +92,8 @@ def test_recipe_runner_requests_fail_closed_reward_post(monkeypatch: pytest.Monk
         runner_module.run_triton_task(
             session=session,
             tools_kwargs={"task": {"name": "triton_operator", "metadata": {}}},
+            remote_docker_hosts="ssh://sandbox-a",
+            evaluator_npu_device_ids="0,1",
             report_reward=True,
         )
     )
@@ -94,3 +101,7 @@ def test_recipe_runner_requests_fail_closed_reward_post(monkeypatch: pytest.Monk
     assert result == "ok"
     assert captured["reward_post_strict"] is True
     assert captured["tools_kwargs"]["task"]["metadata"]["runtime"]["session_id"] == "session-1"
+    assert captured["tools_kwargs"]["task"]["sandbox"]["sandbox_kwargs"]["docker_host"] == "ssh://sandbox-a"
+    assert captured["tools_kwargs"]["task"]["sandbox"]["sandbox_kwargs"]["npu_lock_dir"] == (
+        "/var/lock/triton-agent-npu"
+    )

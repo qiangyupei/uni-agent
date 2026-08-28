@@ -1,17 +1,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from types import MappingProxyType
 from typing import Any
 
 import pytest
 
 from ..trajectory_processor import crop_to_assistant_prefix, process_trajectories
-
-
-@dataclass(frozen=True)
-class Context:
-    options: object
 
 
 @dataclass
@@ -72,7 +66,7 @@ def test_best_index_is_not_applied_across_unordered_gateway_chains() -> None:
 
     selected = process_trajectories(
         (first, second),
-        context=Context(MappingProxyType({"selection": "best"})),
+        selection="best",
     )
 
     assert [len(item.response_ids) for item in selected] == [4, 5]
@@ -86,8 +80,9 @@ def test_best_crop_uses_previous_legal_assistant_boundary() -> None:
     }
     source = trajectory([1, 1, 0, 1, 1], prompt_len=2, reward_info=info)
     selected = process_trajectories(
-        [source],
-        context={"options": {"selection": "best", "max_total_tokens": 4}},
+        (source,),
+        selection="best",
+        max_total_tokens=4,
     )
     assert len(selected) == 1
     assert len(selected[0].response_ids) == 2
@@ -100,7 +95,7 @@ def test_partial_correctness_best_hint_preserves_legacy_selection() -> None:
         "train_best": {"assistant_index": 0},
     }
     source = trajectory([1, 1, 0, 1, 1], reward_info=info)
-    selected = process_trajectories([source], context={"options": {"selection": "best"}})
+    selected = process_trajectories((source,), selection="best")
 
     assert len(selected) == 1
     assert len(selected[0].response_ids) == 2
@@ -109,21 +104,22 @@ def test_partial_correctness_best_hint_preserves_legacy_selection() -> None:
 
 def test_no_impl_empty_policy_is_explicit() -> None:
     source = trajectory([1], reward_info={"no_impl_retry_failed": True})
-    assert process_trajectories([source], context={"options": {"empty_policy": "drop"}}) == []
-    assert process_trajectories([source], context={"options": {"empty_policy": "keep_last"}}) == [source]
+    assert process_trajectories((source,), empty_policy="drop") == []
+    assert process_trajectories((source,), empty_policy="keep_last") == [source]
     with pytest.raises(ValueError, match="no implementation"):
-        process_trajectories([source], context={"options": {"empty_policy": "raise"}})
+        process_trajectories((source,), empty_policy="raise")
 
 
 def test_alignment_error_never_silently_crops_arrays() -> None:
     source = trajectory([1, 1])
     source.response_logprobs = [-0.1]
     with pytest.raises(ValueError, match="response_logprobs"):
-        process_trajectories([source], context={"options": {}})
+        process_trajectories((source,))
     assert (
         process_trajectories(
-            [source],
-            context={"options": {"alignment_error": "drop", "empty_policy": "drop"}},
+            (source,),
+            alignment_error="drop",
+            empty_policy="drop",
         )
         == []
     )

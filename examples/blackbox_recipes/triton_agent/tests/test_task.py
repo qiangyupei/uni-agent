@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import json
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -15,7 +16,6 @@ from uni_agent.sandbox import ExecResult
 from ..task import (
     TritonOperatorTask,
     TritonOperatorTaskConfig,
-    _attested_perf,
     _implementation_status,
     _read_json,
     _train_best,
@@ -23,44 +23,63 @@ from ..task import (
     _validate_trusted_image,
 )
 
+_CURRENT_IMPL = b"class ModelNew:\n    def forward(self, value):\n        return value\n"
+_BEST_IMPL = b"class ModelNew:\n    def forward(self, value):\n        return value + 1\n"
+_STAGED_IMPL = b"class ModelNew:\n    def forward(self, value):\n        return value * 2\n"
+
+
+def _json_bytes(value: dict[str, Any]) -> bytes:
+    return (json.dumps(value, ensure_ascii=False, allow_nan=False) + "\n").encode()
+
+
+def _metrics(*, passed: int = 2, total: int = 2, **extra: Any) -> dict[str, Any]:
+    return {
+        "success": passed == total,
+        "ast_check_ok": True,
+        "compile_ok": True,
+        "correctness_ok": passed == total,
+        "total_cases": total,
+        "passed_cases": passed,
+        "failed_cases": total - passed,
+        **extra,
+    }
+
 
 class FakeSandbox:
     def __init__(
         self,
         *,
         has_impl: bool = True,
+        agent_files: dict[str, bytes | str] | None = None,
         events: list[str] | None = None,
         label: str = "sandbox",
-        verifier_counts: tuple[int, int, int] = (2, 2, 0),
-        tamper_inputs: bool = False,
-        mutate_input_after_verify: bool = False,
         uid: int = 1000,
-        verify_exit_code: int = 0,
         trusted_file_type: str = "regular file",
         trusted_parent_mode: str = "755",
         verify_entrypoint_target: str = "/opt/triton-agent-tools/verify_once.sh",
+        unsafe_directories: set[str] | None = None,
+        mtimes: dict[str, int] | None = None,
+        agent_finished: bool = True,
     ) -> None:
         self.started = False
         self.stopped = False
         self.cleanup_calls = 0
-        self.verify_saw_cleanup = False
         self.events = events
         self.label = label
         self.produce_impl = has_impl
-        self.verifier_counts = verifier_counts
-        self.tamper_inputs = tamper_inputs
-        self.mutate_input_after_verify = mutate_input_after_verify
-        self.verify_reference: bytes | None = None
-        self.verify_cases: bytes | None = None
+        self.agent_files = dict(agent_files or {})
         self.uid = uid
-        self.verify_exit_code = verify_exit_code
         self.trusted_file_type = trusted_file_type
         self.trusted_parent_mode = trusted_parent_mode
         self.verify_entrypoint_target = verify_entrypoint_target
+        self.unsafe_directories = set(unsafe_directories or ())
+        self.mtimes = dict(mtimes or {})
+        self.agent_finished = agent_finished
         self.files: dict[str, bytes] = {}
         self.file_types: dict[str, str] = {}
         self.read_file_calls: list[str] = []
         self.download_file_calls: list[str] = []
+        self.shell_calls: list[str] = []
 
     async def __aenter__(self):
         self.started = True
@@ -75,43 +94,11 @@ class FakeSandbox:
 
     async def exec_shell(self, script, *, timeout=None, workdir=None, env=None):
         del timeout, workdir, env
+        self.shell_calls.append(script)
         if script == "/trusted/cleanup":
             self.cleanup_calls += 1
-        if script.startswith("/trusted/final_verify"):
-            self.verify_saw_cleanup = self.cleanup_calls > 0
-            self.verify_reference = self.files.get("/workspace/src/smoke.py")
-            self.verify_cases = next(
-                (
-                    content
-                    for path, content in self.files.items()
-                    if path.startswith("/workspace/src/smoke_") and path.endswith(".json")
-                ),
-                None,
-            )
-            implementation = self.files.get("/workspace/src/smoke_triton_ascend_impl.py")
-            if implementation is None:
-                return ExecResult(1, "", "missing implementation")
-            digest = hashlib.sha256(implementation).hexdigest()
-            self.files["/workspace/output/verify/verify_result.json"] = json.dumps(
-                {
-                    "total_cases": self.verifier_counts[0],
-                    "passed_cases": self.verifier_counts[1],
-                    "failed_cases": self.verifier_counts[2],
-                    "compile_ok": True,
-                    "verified_impl_path": "src/smoke_triton_ascend_impl.py",
-                    "verified_impl_sha256": digest,
-                }
-            ).encode()
-            self.files["/workspace/output/verify/perf_result.json"] = json.dumps(
-                {
-                    "speedup_vs_torch": 1.0,
-                    "verified_impl_path": "src/smoke_triton_ascend_impl.py",
-                    "verified_impl_sha256": digest,
-                }
-            ).encode()
-            if self.mutate_input_after_verify:
-                self.files["/workspace/src/smoke.py"] = b"# verifier tampered\n"
-            return ExecResult(self.verify_exit_code, "", "verification infrastructure failed")
+        if script.startswith("test -d ") and any(path in script for path in self.unsafe_directories):
+            return ExecResult(1, "", "unsafe directory")
         return ExecResult(0, "", "")
 
     async def exec(self, argv, *, timeout=None, workdir=None, env=None):
@@ -121,7 +108,8 @@ class FakeSandbox:
         if argv == ["id", "-u"]:
             return ExecResult(0, f"{self.uid}\n", "")
         if argv[:2] == ["readlink", "-f"]:
-            return ExecResult(0, f"{self.verify_entrypoint_target}\n", "")
+            target = self.verify_entrypoint_target if argv[-1].endswith("tools/verify_once.sh") else argv[-1]
+            return ExecResult(0, f"{target}\n", "")
         if argv[:2] == ["test", "-f"]:
             return ExecResult(int(argv[2] not in self.files), "", "")
         if argv[:2] == ["test", "-s"]:
@@ -148,10 +136,16 @@ class FakeSandbox:
                 else ExecResult(1, "", "missing")
             )
         if argv[:3] == ["stat", "-c", "%u:%a:%F"]:
-            is_tool = argv[3].endswith((".py", ".sh", "final_verify"))
+            is_tool = argv[3].endswith((".py", ".sh"))
             if is_tool:
                 return ExecResult(0, f"0:755:{self.trusted_file_type}\n", "")
             return ExecResult(0, f"0:{self.trusted_parent_mode}:directory\n", "")
+        if argv[:3] == ["stat", "-c", "%Y"]:
+            path = argv[-1]
+            if path not in self.files:
+                return ExecResult(1, "", "missing")
+            mtime = self.mtimes.get(path, 10 if path.endswith("_triton_ascend_impl.py") else 20)
+            return ExecResult(0, f"{mtime}\n", "")
         if argv and argv[0] == "sha256sum":
             content = self.files.get(argv[1])
             if content is None:
@@ -179,32 +173,340 @@ class FakeAgent:
     async def run(self, *, sandbox, messages):
         del messages
         if sandbox.produce_impl:
-            sandbox.files["/workspace/src/smoke_triton_ascend_impl.py"] = (
-                b"class ModelNew:\n    def forward(self, value):\n        return value\n"
-            )
-        if sandbox.tamper_inputs:
-            sandbox.files["/workspace/src/smoke.py"] = b"# agent tampered\n"
-            for path in list(sandbox.files):
-                if path.startswith("/workspace/src/smoke_") and path.endswith(".json"):
-                    sandbox.files[path] = b'{"tampered":true}\n'
-        return AgentResult(info={"exit_code": 0}, finished=True)
+            sandbox.files["/workspace/src/smoke_triton_ascend_impl.py"] = _CURRENT_IMPL
+        for path, content in sandbox.agent_files.items():
+            sandbox.files[path] = content.encode() if isinstance(content, str) else content
+        return AgentResult(info={"exit_code": 0}, finished=sandbox.agent_finished)
 
 
-def test_task_owns_sandbox_lifecycle_and_reports_compact_extra_info(tmp_path: Path) -> None:
-    sandbox = FakeSandbox()
-    sandbox.files["/workspace/output/verify/agent-controlled.json"] = b"{}\n"
-    sandbox.files["/workspace/metrics.json"] = b'{"agent":"controlled"}\n'
-    sandbox.file_types["/workspace/metrics.json"] = "symbolic link"
-    config = TritonOperatorTaskConfig(
+def _config(*, retry: bool = False, artifact_dir: Path | None = None) -> TritonOperatorTaskConfig:
+    return TritonOperatorTaskConfig(
         sandbox={"provider": "local"},
         agent={"name": "claude_code", "model": {"base_url": "http://unused", "model_name": "unused"}},
         prompt=[{"role": "user", "content": "implement"}],
         metadata={"uid": "uid-1", "op_name": "smoke", "task_code": "class Model: pass\n"},
         template_dir=None,
-        verify_command="/trusted/final_verify {op_name} {workspace_dir}",
         cleanup_command="/trusted/cleanup",
-        artifact_dir=str(tmp_path),
+        retry_on_missing_impl=retry,
+        artifact_dir=str(artifact_dir) if artifact_dir else None,
     )
+
+
+def _evaluate(
+    sandbox: FakeSandbox,
+    *,
+    initial_current: str | None = None,
+    initial_best: str | None = None,
+) -> dict[str, Any]:
+    config = _config()
+    task = TritonOperatorTask(config)
+    return asyncio.run(
+        task._evaluate_workspace(  # noqa: SLF001 - focused recipe behavior test
+            sandbox,
+            config,
+            "/workspace",
+            "smoke",
+            initial_impl_digests={"current": initial_current, "best": initial_best},
+        )
+    )
+
+
+def test_task_config_uses_only_agent_time_verifier() -> None:
+    config = TritonOperatorTaskConfig(sandbox={"provider": "docker"})
+    assert not hasattr(config, "verify_command")
+    assert not hasattr(config, "verify_timeout")
+    assert config.trusted_agent_verify_command == "/opt/triton-agent-tools/verify_once.sh"
+    assert all("final_verify" not in path for path in config.trusted_tool_paths)
+
+
+def test_matching_best_pair_has_priority_and_preserves_train_best() -> None:
+    sandbox = FakeSandbox(has_impl=False)
+    digest = hashlib.sha256(_BEST_IMPL).hexdigest()
+    best = _metrics(
+        perf_data={"speedup_vs_torch": 2.0},
+        reward=999,
+        reward_components={"all_correct_bonus": 999},
+        assistant_snapshot_impl_sha256=digest,
+        assistant_index=2,
+        assistant_messages_seen=3,
+        assistant_index_source="claude_code_transcript_hook",
+    )
+    sandbox.files.update(
+        {
+            "/workspace/src/smoke_triton_ascend_impl_best.py": _BEST_IMPL,
+            "/workspace/metrics_best.json": _json_bytes(best),
+            "/workspace/src/smoke_triton_ascend_impl.py": _CURRENT_IMPL,
+            "/workspace/metrics.json": _json_bytes(_metrics(passed=1)),
+        }
+    )
+
+    evaluation = _evaluate(sandbox)
+
+    assert evaluation["selected_metrics_source"] == "metrics_best"
+    assert evaluation["best_source"] == "best_pair"
+    assert evaluation["used_best_metrics"] is True
+    assert evaluation["metrics"]["metrics_impl_binding"] == "matched"
+    assert evaluation["metrics"]["reward"] == 1.0
+    assert evaluation["metrics"]["reward_components"] == {
+        "ast": 0.05,
+        "compile": 0.25,
+        "correctness": 0.4,
+        "speedup": 0.3,
+        "raw_speedup": 2.0,
+        "total": 1.0,
+    }
+    assert evaluation["train_best"]["assistant_index"] == 2
+
+
+def test_legacy_unbound_best_pair_is_accepted_without_trajectory_hint() -> None:
+    sandbox = FakeSandbox(has_impl=False)
+    sandbox.files.update(
+        {
+            "/workspace/src/smoke_triton_ascend_impl_best.py": _BEST_IMPL,
+            "/workspace/metrics_best.json": _json_bytes(_metrics()),
+        }
+    )
+
+    evaluation = _evaluate(sandbox)
+
+    assert evaluation["selected_metrics_source"] == "metrics_best"
+    assert evaluation["metrics"]["metrics_impl_binding"] == "legacy_unbound"
+    assert "train_best" not in evaluation
+
+
+def test_best_digest_mismatch_falls_back_to_current_metrics() -> None:
+    sandbox = FakeSandbox(has_impl=False)
+    sandbox.files.update(
+        {
+            "/workspace/src/smoke_triton_ascend_impl_best.py": _BEST_IMPL,
+            "/workspace/metrics_best.json": _json_bytes(_metrics(assistant_snapshot_impl_sha256="0" * 64)),
+            "/workspace/src/smoke_triton_ascend_impl.py": _CURRENT_IMPL,
+            "/workspace/metrics.json": _json_bytes(_metrics(passed=1)),
+        }
+    )
+
+    evaluation = _evaluate(sandbox)
+
+    assert evaluation["selected_metrics_source"] == "metrics"
+    assert evaluation["used_best_metrics"] is False
+    assert evaluation["metrics"]["pass_rate"] == 0.5
+
+
+def test_verifier_artifacts_recover_the_staged_implementation_as_best() -> None:
+    sandbox = FakeSandbox(has_impl=False)
+    sandbox.files.update(
+        {
+            "/workspace/output/verify/smoke_triton_ascend_impl.py": _STAGED_IMPL,
+            "/workspace/output/verify/verify_result.json": _json_bytes(
+                {"total_cases": 2, "passed_cases": 1, "failed_cases": 1, "compile_ok": True}
+            ),
+            "/workspace/output/verify/verify_result_summary.json": _json_bytes({"success": False}),
+            "/workspace/output/verify/perf_result.json": _json_bytes({"speedup_vs_torch": 2.0}),
+        }
+    )
+
+    evaluation = _evaluate(sandbox)
+
+    assert evaluation["selected_metrics_source"] == "metrics_best"
+    assert evaluation["best_source"] == "verifier_artifacts"
+    assert evaluation["used_best_metrics"] is True
+    assert evaluation["metrics"]["pass_rate"] == 0.5
+    assert evaluation["metrics"]["reward"] == 0.5
+    assert evaluation["metrics"]["reward_components"]["raw_speedup"] == 0.0
+    assert sandbox.files["/workspace/src/smoke_triton_ascend_impl_best.py"] == _STAGED_IMPL
+    recovered = json.loads(sandbox.files["/workspace/metrics_best.json"])
+    assert recovered["passed_cases"] == 1
+    assert recovered["implementation_sha256"] == hashlib.sha256(_STAGED_IMPL).hexdigest()
+    assert "/workspace/metrics.json" not in sandbox.files
+
+
+def test_full_correctness_artifacts_reuse_valid_performance() -> None:
+    sandbox = FakeSandbox(has_impl=False)
+    sandbox.files.update(
+        {
+            "/workspace/output/verify/smoke_triton_ascend_impl.py": _STAGED_IMPL,
+            "/workspace/output/verify/verify_result.json": _json_bytes(
+                {"total_cases": 2, "passed_cases": 2, "failed_cases": 0, "compile_ok": True}
+            ),
+            "/workspace/output/verify/perf_result.json": _json_bytes({"speedup_vs_torch": 1.0}),
+        }
+    )
+
+    evaluation = _evaluate(sandbox)
+
+    assert evaluation["best_source"] == "verifier_artifacts"
+    assert evaluation["metrics"]["reward"] == 0.85
+    assert evaluation["metrics"]["reward_components"]["raw_speedup"] == 1.0
+
+
+def test_verifier_artifact_digest_mismatch_is_not_recovered() -> None:
+    sandbox = FakeSandbox(has_impl=False)
+    sandbox.files.update(
+        {
+            "/workspace/output/verify/smoke_triton_ascend_impl.py": _STAGED_IMPL,
+            "/workspace/output/verify/verify_result.json": _json_bytes(
+                {
+                    "total_cases": 2,
+                    "passed_cases": 2,
+                    "failed_cases": 0,
+                    "compile_ok": True,
+                    "verified_impl_sha256": "0" * 64,
+                }
+            ),
+        }
+    )
+
+    evaluation = _evaluate(sandbox)
+
+    assert evaluation["selected_metrics_source"] == "not_run_missing_impl"
+    assert evaluation["_has_impl"] is False
+    assert "/workspace/src/smoke_triton_ascend_impl_best.py" not in sandbox.files
+
+
+def test_conflicting_verify_and_perf_digests_are_not_recovered() -> None:
+    digest = hashlib.sha256(_STAGED_IMPL).hexdigest()
+    sandbox = FakeSandbox(has_impl=False)
+    sandbox.files.update(
+        {
+            "/workspace/output/verify/smoke_triton_ascend_impl.py": _STAGED_IMPL,
+            "/workspace/output/verify/verify_result.json": _json_bytes(
+                {
+                    "total_cases": 2,
+                    "passed_cases": 2,
+                    "failed_cases": 0,
+                    "compile_ok": True,
+                    "verified_impl_sha256": digest,
+                }
+            ),
+            "/workspace/output/verify/perf_result.json": _json_bytes(
+                {"speedup_vs_torch": 1.0, "verified_impl_sha256": "0" * 64}
+            ),
+        }
+    )
+
+    evaluation = _evaluate(sandbox)
+
+    assert evaluation["selected_metrics_source"] == "not_run_missing_impl"
+    assert "/workspace/src/smoke_triton_ascend_impl_best.py" not in sandbox.files
+
+
+def test_staged_implementation_newer_than_results_is_not_recovered() -> None:
+    staged_path = "/workspace/output/verify/smoke_triton_ascend_impl.py"
+    verify_path = "/workspace/output/verify/verify_result.json"
+    sandbox = FakeSandbox(has_impl=False, mtimes={staged_path: 30, verify_path: 20})
+    sandbox.files.update(
+        {
+            staged_path: _STAGED_IMPL,
+            verify_path: _json_bytes({"total_cases": 2, "passed_cases": 2, "failed_cases": 0, "compile_ok": True}),
+        }
+    )
+
+    evaluation = _evaluate(sandbox)
+
+    assert evaluation["selected_metrics_source"] == "not_run_missing_impl"
+    assert evaluation["_has_impl"] is False
+    assert "/workspace/src/smoke_triton_ascend_impl_best.py" not in sandbox.files
+
+
+@pytest.mark.parametrize(
+    "verify",
+    [
+        {"total_cases": 0, "passed_cases": 0, "failed_cases": 0},
+        {"total_cases": 2, "passed_cases": 2, "failed_cases": 1},
+        {"total_cases": 2, "passed_cases": True, "failed_cases": 1},
+    ],
+)
+def test_invalid_staged_artifacts_preserve_missing_impl_retry_semantics(verify: dict[str, Any]) -> None:
+    sandbox = FakeSandbox(has_impl=False)
+    sandbox.files.update(
+        {
+            "/workspace/output/verify/smoke_triton_ascend_impl.py": _STAGED_IMPL,
+            "/workspace/output/verify/verify_result.json": _json_bytes(verify),
+        }
+    )
+
+    evaluation = _evaluate(sandbox)
+
+    assert evaluation["selected_metrics_source"] == "not_run_missing_impl"
+    assert evaluation["_has_impl"] is False
+    assert evaluation["metrics"]["error_type"] == "missing_impl"
+
+
+def test_current_metrics_are_the_last_fallback() -> None:
+    sandbox = FakeSandbox(has_impl=False)
+    digest = hashlib.sha256(_CURRENT_IMPL).hexdigest()
+    sandbox.files.update(
+        {
+            "/workspace/src/smoke_triton_ascend_impl.py": _CURRENT_IMPL,
+            "/workspace/metrics.json": _json_bytes(_metrics(passed=1, implementation_sha256=digest, reward=1234)),
+        }
+    )
+
+    evaluation = _evaluate(sandbox)
+
+    assert evaluation["selected_metrics_source"] == "metrics"
+    assert evaluation["used_best_metrics"] is False
+    assert evaluation["metrics"]["metrics_impl_binding"] == "matched"
+    assert evaluation["metrics"]["reward"] == 0.5
+
+
+def test_explicit_ast_failure_is_not_rewritten_as_success() -> None:
+    sandbox = FakeSandbox(has_impl=False)
+    sandbox.files.update(
+        {
+            "/workspace/src/smoke_triton_ascend_impl.py": _CURRENT_IMPL,
+            "/workspace/metrics.json": _json_bytes(_metrics(ast_check_ok=False)),
+        }
+    )
+
+    evaluation = _evaluate(sandbox)
+
+    assert evaluation["metrics"]["ast_check_ok"] is False
+    assert evaluation["metrics"]["reward_components"]["ast"] == 0.0
+    assert evaluation["metrics"]["reward"] == 0.65
+
+
+def test_legacy_compile_only_current_metrics_keep_partial_credit() -> None:
+    sandbox = FakeSandbox(has_impl=False)
+    sandbox.files.update(
+        {
+            "/workspace/src/smoke_triton_ascend_impl.py": _CURRENT_IMPL,
+            "/workspace/metrics.json": _json_bytes({"verify_exit": 1, "compile_ok": True}),
+        }
+    )
+
+    evaluation = _evaluate(sandbox)
+
+    assert evaluation["selected_metrics_source"] == "metrics"
+    assert evaluation["metrics"]["total_cases"] == 0
+    assert evaluation["metrics"]["compile_ok"] is True
+    assert evaluation["metrics"]["correctness_ok"] is False
+    assert evaluation["metrics"]["reward"] == 0.25
+
+
+def test_missing_impl_and_missing_metrics_are_distinct() -> None:
+    missing_impl = _evaluate(FakeSandbox(has_impl=False))
+    assert missing_impl["selected_metrics_source"] == "not_run_missing_impl"
+    assert missing_impl["_has_impl"] is False
+    assert missing_impl["metrics"]["error_type"] == "missing_impl"
+
+    sandbox = FakeSandbox(has_impl=False)
+    sandbox.files["/workspace/src/smoke_triton_ascend_impl.py"] = _CURRENT_IMPL
+    missing_metrics = _evaluate(sandbox)
+    assert missing_metrics["selected_metrics_source"] == "missing_metrics"
+    assert missing_metrics["_has_impl"] is True
+    assert missing_metrics["metrics"]["error_type"] == "missing_metrics"
+
+
+def test_task_reuses_agent_metrics_without_final_reverify_or_output_reset(tmp_path: Path) -> None:
+    preserved = b'{"agent-time":true}\n'
+    sandbox = FakeSandbox(
+        agent_files={
+            "/workspace/metrics.json": _json_bytes(_metrics()),
+            "/workspace/output/verify/agent-controlled.json": preserved,
+        }
+    )
+    config = _config(artifact_dir=tmp_path)
     task = TritonOperatorTask(config)
     task.build_sandbox = lambda: sandbox  # type: ignore[method-assign]
     task.build_agent = lambda: FakeAgent()  # type: ignore[method-assign]
@@ -212,17 +514,107 @@ def test_task_owns_sandbox_lifecycle_and_reports_compact_extra_info(tmp_path: Pa
     result = asyncio.run(task.run())
 
     assert sandbox.started and sandbox.stopped
-    assert sandbox.cleanup_calls == 3
-    assert sandbox.verify_saw_cleanup is True
+    assert sandbox.cleanup_calls == 2
+    assert all("final_verify" not in command for command in sandbox.shell_calls)
+    assert sandbox.files["/workspace/output/verify/agent-controlled.json"] == preserved
     assert result.finished is True
     assert result.accuracy == 1.0
-    assert result.reward == 0.95
+    assert result.reward == 0.7
     assert result.extra_info is not None
-    assert result.extra_info["metrics"]["correctness_ok"] is True
+    assert result.extra_info["selected_metrics_source"] == "metrics"
+    assert result.extra_info["metrics"]["reward_components"]["total"] == 0.7
     assert "task_code" not in result.extra_info
-    assert sandbox.files["/workspace/src/smoke.py"].startswith(b"class Model")
-    assert "/workspace/output/verify/agent-controlled.json" not in sandbox.files
-    assert "/workspace/metrics.json" not in sandbox.download_file_calls
+    settings = json.loads(sandbox.files["/workspace/.claude/settings.json"])
+    assert {"PreToolUse", "PostToolUse", "PostToolUseFailure"} <= settings["hooks"].keys()
+    assert settings["hooks"]["PostToolUseFailure"] == settings["hooks"]["PostToolUse"]
+    policy = json.loads(sandbox.files["/workspace/.claude/hooks/triton_verify_policy.json"])
+    assert policy == {"correctness_patience": 7, "correctness_min_reward": 0.15, "latency_patience": 3}
+
+
+def test_early_stop_is_finished_only_with_a_trainable_best_prefix() -> None:
+    def run(sandbox: FakeSandbox):
+        task = TritonOperatorTask(_config())
+        task.build_sandbox = lambda: sandbox  # type: ignore[method-assign]
+        task.build_agent = lambda: FakeAgent()  # type: ignore[method-assign]
+        return asyncio.run(task.run())
+
+    digest = hashlib.sha256(_BEST_IMPL).hexdigest()
+    stop = {
+        "reason": "no_latency_improvement",
+        "mode": "latency",
+        "patience": 3,
+        "stale_verify_count": 3,
+        "verify_count": 5,
+    }
+    best_metrics = _metrics(
+        assistant_index=1,
+        assistant_messages_seen=2,
+        assistant_index_source="claude_code_transcript_hook",
+        assistant_snapshot_impl_sha256=digest,
+    )
+    best = FakeSandbox(
+        agent_finished=False,
+        agent_files={
+            "/workspace/src/smoke_triton_ascend_impl_best.py": _BEST_IMPL,
+            "/workspace/metrics_best.json": _json_bytes(best_metrics),
+            "/workspace/.triton_verify_stop.json": _json_bytes(stop),
+        },
+    )
+    best_result = run(best)
+    assert best_result.finished is True
+    assert best_result.extra_info["agent"]["early_stop"]["reason"] == "no_latency_improvement"
+
+    current = FakeSandbox(
+        agent_finished=False,
+        agent_files={
+            "/workspace/metrics.json": _json_bytes(_metrics()),
+            "/workspace/.triton_verify_stop.json": _json_bytes(stop),
+        },
+    )
+    assert run(current).finished is False
+
+
+def test_missing_impl_retry_uses_a_fresh_sandbox() -> None:
+    events: list[str] = []
+    sandboxes = [
+        FakeSandbox(has_impl=False, events=events, label="first"),
+        FakeSandbox(
+            has_impl=True,
+            agent_files={"/workspace/metrics.json": _json_bytes(_metrics())},
+            events=events,
+            label="second",
+        ),
+    ]
+    config = _config(retry=True)
+    task = TritonOperatorTask(config)
+    remaining = iter(sandboxes)
+    task.build_sandbox = lambda: next(remaining)  # type: ignore[method-assign]
+    task.build_agent = lambda: FakeAgent()  # type: ignore[method-assign]
+
+    result = asyncio.run(task.run())
+
+    assert events == ["first:enter", "first:exit", "second:enter", "second:exit"]
+    assert result.reward == 0.7
+    assert result.extra_info is not None
+    assert result.extra_info["no_impl_retry_used"] is True
+    assert result.extra_info["no_impl_retry_discard_previous"] is True
+
+
+def test_valid_implementation_without_metrics_is_not_retried() -> None:
+    events: list[str] = []
+    sandbox = FakeSandbox(has_impl=True, events=events, label="only")
+    config = _config(retry=True)
+    task = TritonOperatorTask(config)
+    task.build_sandbox = lambda: sandbox  # type: ignore[method-assign]
+    task.build_agent = lambda: FakeAgent()  # type: ignore[method-assign]
+
+    result = asyncio.run(task.run())
+
+    assert events == ["only:enter", "only:exit"]
+    assert result.reward == 0.0
+    assert result.extra_info is not None
+    assert result.extra_info["selected_metrics_source"] == "missing_metrics"
+    assert "no_impl_retry_used" not in result.extra_info
 
 
 def test_stub_or_missing_modelnew_is_not_a_generated_implementation() -> None:
@@ -248,45 +640,24 @@ def test_stub_or_missing_modelnew_is_not_a_generated_implementation() -> None:
 def test_implementation_shape_uses_ast_not_comments_or_substrings() -> None:
     sandbox = FakeSandbox()
     path = "/workspace/src/smoke_triton_ascend_impl.py"
-    sandbox.files[path] = (
-        b"""\n# class ModelNew: pass\ndef helper():\n    return "class ModelNew and NotImplementedError"\n"""
-    )
+    sandbox.files[path] = b'# class ModelNew: pass\ndef helper():\n    return "class ModelNew"\n'
     status = asyncio.run(_implementation_status(sandbox, path, baseline_digest=None))
     assert status["reason"] == "missing_model_new"
 
     sandbox.files[path] = (
-        b"\nclass ModelNew:\n"
+        b"class ModelNew:\n"
         b'    """NotImplementedError is discussed here, not raised."""\n'
         b"    def forward(self, value):\n"
         b"        return value\n"
     )
     status = asyncio.run(_implementation_status(sandbox, path, baseline_digest=None))
     assert status["substantive"] is True
-    assert status["reason"] == "valid_impl_shape"
-
-
-def test_template_constructor_does_not_hide_stub_forward() -> None:
-    sandbox = FakeSandbox()
-    path = "/workspace/src/smoke_triton_ascend_impl.py"
-    sandbox.files[path] = (
-        b"class ModelNew(nn.Module):\n"
-        b"    def __init__(self):\n"
-        b"        super().__init__()\n"
-        b"    def forward(self, value):\n"
-        b"        raise NotImplementedError('replace this stub')\n"
-        b"# agent changed only this comment\n"
-    )
-
-    status = asyncio.run(_implementation_status(sandbox, path, baseline_digest="0" * 64))
-
-    assert status["substantive"] is False
-    assert status["reason"] == "not_implemented"
 
 
 def test_agent_symlink_implementation_is_rejected_without_reading_target() -> None:
     sandbox = FakeSandbox()
     path = "/workspace/src/smoke_triton_ascend_impl.py"
-    sandbox.files[path] = b"class ModelNew: pass\n"
+    sandbox.files[path] = _CURRENT_IMPL
     sandbox.file_types[path] = "symbolic link"
 
     status = asyncio.run(_implementation_status(sandbox, path, baseline_digest=None))
@@ -313,22 +684,6 @@ def test_json_reads_reject_symlinks_oversize_and_non_finite_values() -> None:
     assert asyncio.run(_read_json(sandbox, path)) is None
 
 
-def test_performance_data_must_be_finite_and_bound_to_verified_bytes() -> None:
-    digest = "a" * 64
-    base = {
-        "verified_impl_path": "src/smoke_triton_ascend_impl.py",
-        "verified_impl_sha256": digest,
-        "speedup": 1.5,
-    }
-    assert _attested_perf(base, "/workspace", "src/smoke_triton_ascend_impl.py", digest) == base
-    assert _attested_perf({**base, "speedup": float("inf")}, "/workspace", base["verified_impl_path"], digest) is None
-    assert _attested_perf({**base, "speedup": "1.5"}, "/workspace", base["verified_impl_path"], digest) is None
-    assert (
-        _attested_perf({**base, "verified_impl_sha256": "b" * 64}, "/workspace", base["verified_impl_path"], digest)
-        is None
-    )
-
-
 def test_best_hint_requires_consistent_native_hook_metadata() -> None:
     digest = "a" * 64
     valid = {
@@ -344,7 +699,7 @@ def test_best_hint_requires_consistent_native_hook_metadata() -> None:
 
 def test_trusted_image_rejects_root_agent_user() -> None:
     with pytest.raises(RuntimeError, match="non-root"):
-        asyncio.run(_validate_trusted_image(FakeSandbox(uid=0), ("/trusted/final_verify",)))
+        asyncio.run(_validate_trusted_image(FakeSandbox(uid=0), ("/opt/triton-agent-tools/verify_once.sh",)))
 
 
 def test_trusted_image_rejects_symlink_tool_or_writable_parent() -> None:
@@ -352,7 +707,14 @@ def test_trusted_image_rejects_symlink_tool_or_writable_parent() -> None:
         asyncio.run(
             _validate_trusted_image(
                 FakeSandbox(trusted_file_type="symbolic link"),
-                ("/opt/triton-agent-tools/final_verify.sh",),
+                ("/opt/triton-agent-tools/verify_once.sh",),
+            )
+        )
+    with pytest.raises(RuntimeError, match="trusted tool parent"):
+        asyncio.run(
+            _validate_trusted_image(
+                FakeSandbox(trusted_parent_mode="777"),
+                ("/opt/triton-agent-tools/verify_once.sh",),
             )
         )
 
@@ -367,165 +729,3 @@ def test_agent_verify_entrypoint_must_resolve_to_trusted_command() -> None:
                 "/opt/triton-agent-tools/verify_once.sh",
             )
         )
-    with pytest.raises(RuntimeError, match="trusted tool parent"):
-        asyncio.run(
-            _validate_trusted_image(
-                FakeSandbox(trusted_parent_mode="777"),
-                ("/opt/triton-agent-tools/final_verify.sh",),
-            )
-        )
-
-
-def test_missing_impl_retry_uses_a_fresh_sandbox() -> None:
-    events: list[str] = []
-    sandboxes = [
-        FakeSandbox(has_impl=False, events=events, label="first"),
-        FakeSandbox(has_impl=True, events=events, label="second"),
-    ]
-    config = TritonOperatorTaskConfig(
-        sandbox={"provider": "local"},
-        agent={"name": "claude_code", "model": {"base_url": "http://unused", "model_name": "unused"}},
-        prompt=[{"role": "user", "content": "implement"}],
-        metadata={"uid": "uid-1", "op_name": "smoke", "task_code": "class Model: pass\n"},
-        template_dir=None,
-        verify_command="/trusted/final_verify {op_name} {workspace_dir}",
-        cleanup_command="/trusted/cleanup",
-        retry_on_missing_impl=True,
-    )
-    task = TritonOperatorTask(config)
-    remaining = iter(sandboxes)
-    task.build_sandbox = lambda: next(remaining)  # type: ignore[method-assign]
-    task.build_agent = lambda: FakeAgent()  # type: ignore[method-assign]
-
-    result = asyncio.run(task.run())
-
-    assert events == ["first:enter", "first:exit", "second:enter", "second:exit"]
-    assert result.reward == 0.95
-    assert result.extra_info is not None
-    assert result.extra_info["no_impl_retry_used"] is True
-    assert result.extra_info["no_impl_retry_discard_previous"] is True
-
-
-def test_zero_case_verifier_output_is_untrusted() -> None:
-    sandbox = FakeSandbox(verifier_counts=(0, 0, 0))
-    config = TritonOperatorTaskConfig(
-        sandbox={"provider": "local"},
-        agent={"name": "claude_code", "model": {"base_url": "http://unused", "model_name": "unused"}},
-        prompt=[{"role": "user", "content": "implement"}],
-        metadata={"uid": "uid-1", "op_name": "smoke", "task_code": "class Model: pass\n"},
-        template_dir=None,
-        verify_command="/trusted/final_verify {op_name} {workspace_dir}",
-        cleanup_command="/trusted/cleanup",
-        retry_on_missing_impl=False,
-    )
-    task = TritonOperatorTask(config)
-    task.build_sandbox = lambda: sandbox  # type: ignore[method-assign]
-    task.build_agent = lambda: FakeAgent()  # type: ignore[method-assign]
-
-    result = asyncio.run(task.run())
-
-    assert result.reward == 0.0
-    assert result.extra_info is not None
-    assert result.extra_info["metrics"]["verifier_attested"] is False
-    assert result.extra_info["metrics"]["error_type"] == "untrusted_verifier_output"
-
-
-def test_partial_correctness_keeps_reward_when_evaluation_completed() -> None:
-    sandbox = FakeSandbox(verifier_counts=(2, 1, 1))
-    config = TritonOperatorTaskConfig(
-        sandbox={"provider": "local"},
-        agent={"name": "claude_code", "model": {"base_url": "http://unused", "model_name": "unused"}},
-        prompt=[{"role": "user", "content": "implement"}],
-        metadata={"uid": "uid-1", "op_name": "smoke", "task_code": "class Model: pass\n"},
-        template_dir=None,
-        verify_command="/trusted/final_verify {op_name} {workspace_dir}",
-        cleanup_command="/trusted/cleanup",
-        retry_on_missing_impl=False,
-    )
-    task = TritonOperatorTask(config)
-    task.build_sandbox = lambda: sandbox  # type: ignore[method-assign]
-    task.build_agent = lambda: FakeAgent()  # type: ignore[method-assign]
-
-    result = asyncio.run(task.run())
-
-    assert result.accuracy == 0.5
-    assert result.reward == 0.475
-    assert result.extra_info is not None
-    assert result.extra_info["metrics"]["verifier_attested"] is True
-
-
-def test_nonzero_final_verifier_exit_is_infrastructure_failure() -> None:
-    sandbox = FakeSandbox(verifier_counts=(2, 1, 1), verify_exit_code=3)
-    config = TritonOperatorTaskConfig(
-        sandbox={"provider": "local"},
-        agent={"name": "claude_code", "model": {"base_url": "http://unused", "model_name": "unused"}},
-        prompt=[{"role": "user", "content": "implement"}],
-        metadata={"uid": "uid-1", "op_name": "smoke", "task_code": "class Model: pass\n"},
-        template_dir=None,
-        verify_command="/trusted/final_verify {op_name} {workspace_dir}",
-        cleanup_command="/trusted/cleanup",
-        retry_on_missing_impl=False,
-    )
-    task = TritonOperatorTask(config)
-    task.build_sandbox = lambda: sandbox  # type: ignore[method-assign]
-    task.build_agent = lambda: FakeAgent()  # type: ignore[method-assign]
-
-    result = asyncio.run(task.run())
-
-    assert result.reward == 0.0
-    assert result.extra_info is not None
-    assert result.extra_info["metrics"]["verifier_attested"] is False
-
-
-def test_agent_tampered_reference_and_cases_are_restored_before_verify() -> None:
-    sandbox = FakeSandbox(tamper_inputs=True)
-    config = TritonOperatorTaskConfig(
-        sandbox={"provider": "local"},
-        agent={"name": "claude_code", "model": {"base_url": "http://unused", "model_name": "unused"}},
-        prompt=[{"role": "user", "content": "implement"}],
-        metadata={
-            "uid": "uid-1",
-            "op_name": "smoke",
-            "task_code": "class Model: pass\n",
-            "support_files": [{"name": "smoke_cases.json", "content": '{"case":1}\n'}],
-        },
-        template_dir=None,
-        verify_command="/trusted/final_verify {op_name} {workspace_dir}",
-        cleanup_command="/trusted/cleanup",
-        retry_on_missing_impl=False,
-    )
-    task = TritonOperatorTask(config)
-    task.build_sandbox = lambda: sandbox  # type: ignore[method-assign]
-    task.build_agent = lambda: FakeAgent()  # type: ignore[method-assign]
-
-    result = asyncio.run(task.run())
-
-    assert result.reward == 0.95
-    assert sandbox.verify_reference == b"class Model: pass\n"
-    assert sandbox.verify_cases == b'{"case":1}\n'
-    assert result.extra_info is not None
-    assert result.extra_info["metrics"]["verifier_inputs_intact"] is True
-
-
-def test_verifier_input_mutation_after_reset_invalidates_attestation() -> None:
-    sandbox = FakeSandbox(mutate_input_after_verify=True)
-    config = TritonOperatorTaskConfig(
-        sandbox={"provider": "local"},
-        agent={"name": "claude_code", "model": {"base_url": "http://unused", "model_name": "unused"}},
-        prompt=[{"role": "user", "content": "implement"}],
-        metadata={"uid": "uid-1", "op_name": "smoke", "task_code": "class Model: pass\n"},
-        template_dir=None,
-        verify_command="/trusted/final_verify {op_name} {workspace_dir}",
-        cleanup_command="/trusted/cleanup",
-        retry_on_missing_impl=False,
-    )
-    task = TritonOperatorTask(config)
-    task.build_sandbox = lambda: sandbox  # type: ignore[method-assign]
-    task.build_agent = lambda: FakeAgent()  # type: ignore[method-assign]
-
-    result = asyncio.run(task.run())
-
-    assert result.reward == 0.0
-    assert result.extra_info is not None
-    assert result.extra_info["metrics"]["verifier_inputs_intact"] is False
-    assert result.extra_info["metrics"]["verifier_attested"] is False

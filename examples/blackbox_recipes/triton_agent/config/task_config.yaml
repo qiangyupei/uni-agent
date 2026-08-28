@@ -1,15 +1,26 @@
 - name: triton_operator
   sandbox:
-    provider: openyuanrong
+    provider: triton_remote_docker
     image: REPLACE_WITH_PINNED_TRITON_AGENT_NPU_IMAGE_DIGEST
-    runtime_timeout: 4200
+    runtime_timeout: 15000
     sandbox_kwargs:
+      # docker_host and the host-local NPU lock mount are injected per session.
       cwd: /workspace
-      idle_timeout: 4800
+      pull_policy: never
+      run_args:
+        - --privileged
+        - --ipc=host
+        - --network=host
+        - --volume=/dev:/dev
+        - --volume=/usr/local/Ascend/driver:/usr/local/Ascend/driver:ro
+        - --volume=/usr/local/Ascend/firmware:/usr/local/Ascend/firmware:ro
+        - --volume=/usr/local/dcmi:/usr/local/dcmi:ro
+        - --volume=/usr/local/bin/npu-smi:/usr/local/bin/npu-smi:ro
+        - --volume=/etc/ascend_install.info:/etc/ascend_install.info:ro
   agent:
     name: claude_code
     max_turns: 120
-    run_timeout: 1800
+    run_timeout: 9000
     extra_args:
       - --disable-slash-commands
     model:
@@ -19,8 +30,6 @@
   workspace_dir: /workspace
   template_dir: /opt/triton-agent-template
   setup_timeout: 120
-  verify_timeout: 1200
-  verify_command: /opt/triton-agent-tools/with_npu_lease.py -- /opt/triton-agent-tools/final_verify.sh {op_name} {workspace_dir}
   npu_lease_command: /opt/triton-agent-tools/with_npu_lease.py
   npu_lease_required: true
   agent_verify_entrypoint: tools/verify_once.sh
@@ -29,13 +38,15 @@
   trusted_tool_paths:
     - /opt/triton-agent-tools/with_npu_lease.py
     - /opt/triton-agent-tools/verify_once.sh
-    - /opt/triton-agent-tools/final_verify.sh
     - /opt/triton-agent-tools/cleanup_task_processes.sh
   cleanup_timeout: 30
   cleanup_command: /opt/triton-agent-tools/cleanup_task_processes.sh
   # Opt in only after a real Gateway test proves retry chain/attempt identity.
   retry_on_missing_impl: false
   install_transcript_hooks: true
+  verify_early_stop_patience: 7
+  verify_early_stop_min_reward: 0.15
+  latency_optimize_patience: 3
   artifact_dir: null
   artifact_timeout: 120
   max_artifact_bytes: 2097152

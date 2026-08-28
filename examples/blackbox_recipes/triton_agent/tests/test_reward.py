@@ -14,13 +14,14 @@ def test_partial_correctness_and_speedup_reward() -> None:
     )
     scored = attach_reward(metrics)
     assert scored["pass_rate"] == 0.5
-    assert scored["reward_components"]["compile"] == 0.1
-    assert scored["reward_components"]["correctness"] == 0.275
-    assert scored["reward_components"]["speedup"] == 0.2
-    assert scored["reward"] == pytest.approx(0.575)
+    assert scored["reward_components"]["compile"] == 0.25
+    assert scored["reward_components"]["correctness"] == 0.2
+    assert scored["reward_components"]["speedup"] == 0.15
+    assert "all_correct_bonus" not in scored["reward_components"]
+    assert scored["reward"] == pytest.approx(0.6)
 
 
-def test_all_correct_preserves_original_uncapped_reward_shape() -> None:
+def test_all_correct_uses_the_same_continuous_components() -> None:
     metrics = normalize_metrics(
         None,
         verify={"total_cases": 2, "passed_cases": 2, "failed_cases": 0},
@@ -28,7 +29,8 @@ def test_all_correct_preserves_original_uncapped_reward_shape() -> None:
     )
     scored = attach_reward(metrics)
     assert scored["correctness_ok"] is True
-    assert scored["reward"] == pytest.approx(1.15)
+    assert "all_correct_bonus" not in scored["reward_components"]
+    assert scored["reward"] == pytest.approx(0.95)
 
 
 def test_untrusted_boolean_strings_and_non_finite_speedup_do_not_score() -> None:

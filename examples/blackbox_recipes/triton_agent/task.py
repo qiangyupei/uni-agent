@@ -35,6 +35,7 @@ _ARTIFACT_PATHS = (
 _MAX_JSON_BYTES = 1024 * 1024
 _MAX_IMPLEMENTATION_BYTES = 2 * 1024 * 1024
 _FILE_READ_TIMEOUT = 30.0
+_EARLY_STOP_PATH = ".triton_verify_stop.json"
 
 
 class TritonOperatorTaskConfig(TaskConfig):
@@ -44,13 +45,6 @@ class TritonOperatorTaskConfig(TaskConfig):
         default="/opt/triton-agent-template",
         description="Root-owned task/verifier template baked into the sandbox image; None stages only sample files.",
     )
-    verify_command: str = Field(
-        default=(
-            "/opt/triton-agent-tools/with_npu_lease.py -- "
-            "/opt/triton-agent-tools/final_verify.sh {op_name} {workspace_dir}"
-        ),
-        description="Final verifier command. Only quoted {op_name} and {workspace_dir} placeholders are supported.",
-    )
     npu_lease_command: str = "/opt/triton-agent-tools/with_npu_lease.py"
     npu_lease_required: bool = True
     agent_verify_entrypoint: str = "tools/verify_once.sh"
@@ -59,11 +53,9 @@ class TritonOperatorTaskConfig(TaskConfig):
     trusted_tool_paths: tuple[str, ...] = (
         "/opt/triton-agent-tools/with_npu_lease.py",
         "/opt/triton-agent-tools/verify_once.sh",
-        "/opt/triton-agent-tools/final_verify.sh",
         "/opt/triton-agent-tools/cleanup_task_processes.sh",
     )
     setup_timeout: float = 120.0
-    verify_timeout: float = 1200.0
     cleanup_timeout: float = 30.0
     cleanup_command: str | None = Field(
         default="/opt/triton-agent-tools/cleanup_task_processes.sh",
@@ -78,6 +70,9 @@ class TritonOperatorTaskConfig(TaskConfig):
     reward_weights: dict[str, float] = Field(default_factory=dict)
     retry_on_missing_impl: bool = False
     install_transcript_hooks: bool = True
+    verify_early_stop_patience: int = Field(default=7, ge=0)
+    verify_early_stop_min_reward: float = Field(default=0.15, ge=0)
+    latency_optimize_patience: int = Field(default=3, ge=0)
 
     @field_validator("workspace_dir")
     @classmethod
@@ -92,7 +87,7 @@ class TritonOperatorTaskConfig(TaskConfig):
 
 @register_task("triton_operator")
 class TritonOperatorTask(Task):
-    """Stage one task, run stock Claude Code, verify it, then destroy its sandbox.
+    """Stage one task, run stock Claude Code, select its metrics, then destroy its sandbox.
 
     A missing-implementation retry gets a *new* context-managed sandbox while
     retaining the same Gateway session. This produces a new chain without any
@@ -183,26 +178,30 @@ class TritonOperatorTask(Task):
                     }
                 except asyncio.CancelledError:
                     raise
-                except Exception as exc:  # preserve partial workspace for final verification
+                except Exception as exc:  # preserve partial workspace and agent-time verifier artifacts
                     logger.exception("Claude Code failed for %s; evaluating partial workspace", op_name)
                     agent_info = {"finished": False, "error_type": type(exc).__name__, "error": str(exc)[:512]}
                     finished = False
                 agent_ms = _elapsed_ms(agent_started)
 
-                # No agent/verifier child may race the trusted final verifier or
-                # keep an evaluator NPU context alive. This command is an
-                # immutable image asset and failure aborts the attempt.
+                # Stop Claude and any agent-time verifier children before reading
+                # their snapshots. This also releases any evaluator NPU lease.
                 await self._cleanup_task_processes(sandbox, cfg, workspace, required=True)
-                verify_started = time.monotonic()
-                evaluation = await self._verify_workspace(
+                early_stop = await _read_early_stop(sandbox, workspace)
+                evaluate_started = time.monotonic()
+                evaluation = await self._evaluate_workspace(
                     sandbox,
                     cfg,
                     workspace,
                     op_name,
-                    metadata=metadata,
                     initial_impl_digests=initial_impl_digests,
                 )
-                verify_ms = _elapsed_ms(verify_started)
+                if early_stop is not None:
+                    agent_info["early_stop"] = early_stop
+                    if evaluation.get("train_best"):
+                        finished = True
+                        agent_info["finished"] = True
+                evaluate_ms = _elapsed_ms(evaluate_started)
                 await self._collect_artifacts(
                     sandbox,
                     cfg,
@@ -221,7 +220,7 @@ class TritonOperatorTask(Task):
         timing = {
             "setup": setup_ms,
             "agent": agent_ms,
-            "verify": verify_ms,
+            "evaluate": evaluate_ms,
             "total": _elapsed_ms(attempt_started),
         }
         return evaluation, agent_info, finished, timing
@@ -236,7 +235,7 @@ class TritonOperatorTask(Task):
     ) -> None:
         if not cfg.cleanup_command:
             if required:
-                raise RuntimeError("cleanup_command is required before trusted final verification")
+                raise RuntimeError("cleanup_command is required before reading agent-time verifier artifacts")
             return
         result = await asyncio.shield(
             sandbox.exec_shell(
@@ -246,7 +245,7 @@ class TritonOperatorTask(Task):
             )
         )
         if required:
-            _require_success(result, "pre-verification process cleanup")
+            _require_success(result, "pre-evaluation process cleanup")
 
     async def _prepare_workspace(
         self,
@@ -310,21 +309,39 @@ class TritonOperatorTask(Task):
             json.dumps(public_metadata, ensure_ascii=False, indent=2) + "\n",
         )
         if cfg.install_transcript_hooks:
-            await self._install_transcript_hooks(sandbox, cfg.workspace_dir)
+            await self._install_transcript_hooks(sandbox, cfg)
 
-    async def _install_transcript_hooks(self, sandbox: Sandbox, workspace: str) -> None:
+    async def _install_transcript_hooks(self, sandbox: Sandbox, cfg: TritonOperatorTaskConfig) -> None:
+        workspace = cfg.workspace_dir
         hook_source = (Path(__file__).with_name("assets") / "track_verify_snapshot.py").read_bytes()
         hook_path = f"{workspace}/.claude/hooks/track_verify_snapshot.py"
+        policy_path = f"{workspace}/.claude/hooks/triton_verify_policy.json"
         created = await sandbox.exec(["mkdir", "-p", f"{workspace}/.claude/hooks"], timeout=10)
         _require_success(created, "Claude transcript hook directory setup")
         await sandbox.write_file(hook_path, hook_source)
+        await sandbox.write_file(
+            policy_path,
+            json.dumps(
+                {
+                    "correctness_patience": cfg.verify_early_stop_patience,
+                    "correctness_min_reward": cfg.verify_early_stop_min_reward,
+                    "latency_patience": cfg.latency_optimize_patience,
+                },
+                separators=(",", ":"),
+            )
+            + "\n",
+        )
         settings_path = f"{workspace}/.claude/settings.json"
         settings = await _read_json(sandbox, settings_path) or {}
         hooks = settings.setdefault("hooks", {})
         if not isinstance(hooks, dict):
             raise TypeError(".claude/settings.json 'hooks' must be a mapping")
         quoted_hook = shlex.quote(hook_path)
-        for event, mode in (("PreToolUse", "pre"), ("PostToolUse", "post")):
+        for event, mode in (
+            ("PreToolUse", "pre"),
+            ("PostToolUse", "post"),
+            ("PostToolUseFailure", "post"),
+        ):
             entries = hooks.setdefault(event, [])
             if not isinstance(entries, list):
                 raise TypeError(f".claude/settings.json hooks.{event} must be a list")
@@ -337,33 +354,25 @@ class TritonOperatorTask(Task):
                     }
                 )
         await sandbox.write_file(settings_path, json.dumps(settings, ensure_ascii=False, indent=2) + "\n")
-        result = await sandbox.exec(["chmod", "0444", hook_path, settings_path], timeout=10)
+        result = await sandbox.exec(["chmod", "0444", hook_path, policy_path, settings_path], timeout=10)
         _require_success(result, "Claude transcript hook protection")
 
-    async def _verify_workspace(
+    async def _evaluate_workspace(
         self,
         sandbox: Sandbox,
         cfg: TritonOperatorTaskConfig,
         workspace: str,
         op_name: str,
         *,
-        metadata: dict[str, Any],
         initial_impl_digests: dict[str, str | None],
     ) -> dict[str, Any]:
-        expected_inputs = await _restore_verifier_inputs(
-            sandbox,
-            workspace,
-            metadata,
-            op_name,
-        )
-        input_manifest_digest = _digest_manifest(expected_inputs)
-        # Capture only the assistant hint from the agent-time best pair. Its
-        # numerical metrics are never trusted for reward.
-        best = await _read_json(sandbox, f"{workspace}/metrics_best.json")
+        """Reuse the same agent-time metric selection order as the legacy recipe."""
+
+        if not await _plain_directory(sandbox, workspace) or not await _plain_directory(sandbox, f"{workspace}/src"):
+            raise RuntimeError("workspace and src must be real directories before metric evaluation")
         best_impl_path = f"{workspace}/src/{op_name}_triton_ascend_impl_best.py"
-        generated_digests = await _implementation_digests(sandbox, workspace, op_name)
-        best_impl_digest = generated_digests["best"]
         current_impl_path = f"{workspace}/src/{op_name}_triton_ascend_impl.py"
+        staged_impl_path = f"{workspace}/output/verify/{op_name}_triton_ascend_impl.py"
         best_status = await _implementation_status(
             sandbox,
             best_impl_path,
@@ -374,9 +383,153 @@ class TritonOperatorTask(Task):
             current_impl_path,
             baseline_digest=initial_impl_digests.get("current"),
         )
-        has_best_impl = bool(best_status["substantive"])
-        has_current_impl = bool(current_status["substantive"])
-        has_impl = has_best_impl or has_current_impl
+        artifact_dirs_safe = await _plain_directory(sandbox, f"{workspace}/output") and await _plain_directory(
+            sandbox, f"{workspace}/output/verify"
+        )
+        staged_status = (
+            await _implementation_status(sandbox, staged_impl_path, baseline_digest=None)
+            if artifact_dirs_safe
+            else {"substantive": False, "digest": None, "reason": "unsafe_artifact_directory"}
+        )
+
+        def finish(
+            raw_metrics: dict[str, Any],
+            *,
+            source: str,
+            implementation_path: str,
+            implementation_digest: str,
+            used_best: bool,
+            binding: str,
+            best_source: str | None = None,
+        ) -> dict[str, Any]:
+            canonical = _canonical_agent_metric_snapshot(raw_metrics, op_name=op_name)
+            if canonical is None:
+                raise ValueError(f"invalid agent-time metrics selected from {source}")
+            # Artifact recovery follows verify_once's validated staged source.
+            # Paired legacy files retain their explicit AST result instead of
+            # silently turning a recorded failure into partial reward.
+            canonical["ast_check_ok"] = (
+                True if best_source == "verifier_artifacts" else raw_metrics.get("ast_check_ok") is True
+            )
+            metrics = normalize_metrics(canonical, op_name=op_name)
+            metrics = attach_reward(metrics, cfg.reward_weights)
+            metrics.update(
+                {
+                    "agent_time_metrics_reused": True,
+                    "metrics_impl_path": implementation_path,
+                    "metrics_impl_sha256": implementation_digest,
+                    "metrics_impl_binding": binding,
+                }
+            )
+            evaluation: dict[str, Any] = {
+                "metrics": metrics,
+                "selected_metrics_source": source,
+                "used_best_metrics": used_best,
+                "_has_impl": True,
+            }
+            if best_source is not None:
+                evaluation["best_source"] = best_source
+            if used_best:
+                train_best = _train_best(
+                    raw_metrics,
+                    source,
+                    best_impl_digest=implementation_digest,
+                )
+                if train_best:
+                    evaluation["train_best"] = train_best
+            return evaluation
+
+        # Legacy priority 1: a paired best implementation and metrics snapshot.
+        best = await _read_json(sandbox, f"{workspace}/metrics_best.json")
+        best_digest = best_status.get("digest") if best_status["substantive"] else None
+        if isinstance(best, dict) and best_digest and _has_verify_signal(best):
+            binding = _metric_impl_binding(best, best_digest)
+            if binding is not None and _canonical_agent_metric_snapshot(best, op_name=op_name) is not None:
+                return finish(
+                    best,
+                    source="metrics_best",
+                    implementation_path=f"src/{op_name}_triton_ascend_impl_best.py",
+                    implementation_digest=best_digest,
+                    used_best=True,
+                    binding=binding,
+                    best_source="best_pair",
+                )
+            logger.warning("ignoring metrics_best with a mismatched implementation digest for %s", op_name)
+
+        # Legacy priority 2: recover the latest verified staged implementation
+        # and metrics from the verifier artifacts left by verify_once.sh.
+        summary = (
+            await _read_json(sandbox, f"{workspace}/output/verify/verify_result_summary.json")
+            if artifact_dirs_safe
+            else None
+        )
+        verify = (
+            await _read_json(sandbox, f"{workspace}/output/verify/verify_result.json") if artifact_dirs_safe else None
+        )
+        perf = await _read_json(sandbox, f"{workspace}/output/verify/perf_result.json") if artifact_dirs_safe else None
+        artifact_metrics = _metrics_from_agent_verify_artifacts(
+            op_name=op_name,
+            summary=summary,
+            verify=verify,
+            perf=perf,
+        )
+        staged_digest = staged_status.get("digest") if staged_status["substantive"] else None
+        artifact_binding = _combined_metric_impl_binding(
+            (summary, verify, perf),
+            staged_digest or "",
+        )
+        artifacts_not_older = await _staged_implementation_precedes_artifacts(
+            sandbox,
+            staged_impl_path,
+            (
+                f"{workspace}/output/verify/verify_result_summary.json",
+                f"{workspace}/output/verify/verify_result.json",
+                f"{workspace}/output/verify/perf_result.json",
+            ),
+        )
+        if artifact_metrics is not None and staged_digest and artifact_binding is not None and artifacts_not_older:
+            recovered = await _recover_agent_time_best(
+                sandbox,
+                workspace,
+                op_name,
+                staged_impl_path=staged_impl_path,
+                staged_digest=staged_digest,
+                metrics=artifact_metrics,
+            )
+            if recovered:
+                return finish(
+                    artifact_metrics,
+                    source="metrics_best",
+                    implementation_path=f"src/{op_name}_triton_ascend_impl_best.py",
+                    implementation_digest=staged_digest,
+                    used_best=True,
+                    binding=artifact_binding,
+                    best_source="verifier_artifacts",
+                )
+
+        # Legacy priority 3: the flat metrics.json paired with current source.
+        current = await _read_json(sandbox, f"{workspace}/metrics.json")
+        current_digest = current_status.get("digest") if current_status["substantive"] else None
+        if isinstance(current, dict) and current_digest and _has_verify_signal(current):
+            binding = _metric_impl_binding(current, current_digest)
+            canonical_current = _canonical_agent_metric_snapshot(current, op_name=op_name)
+        else:
+            binding = None
+            canonical_current = None
+        if canonical_current is not None and current_digest and binding is not None:
+            return finish(
+                current,
+                source="metrics",
+                implementation_path=f"src/{op_name}_triton_ascend_impl.py",
+                implementation_digest=current_digest,
+                used_best=False,
+                binding=binding,
+            )
+
+        # A staged source counts only when its verifier artifacts were valid
+        # enough to recover the pair above. Otherwise preserve the legacy
+        # missing-implementation retry semantics.
+        has_impl = bool(best_status["substantive"] or current_status["substantive"])
         if not has_impl:
             metrics = normalize_metrics(None, op_name=op_name)
             metrics.update(
@@ -385,13 +538,11 @@ class TritonOperatorTask(Task):
                     "compile_ok": False,
                     "correctness_ok": False,
                     "pass_rate": 0.0,
-                    "verifier_attested": False,
-                    "verifier_inputs_intact": True,
-                    "verifier_input_manifest_sha256": input_manifest_digest,
                     "error_type": "missing_impl",
                     "error": (
                         "no substantive ModelNew implementation changed from the fresh workspace baseline: "
-                        f"current={current_status['reason']}, best={best_status['reason']}"
+                        f"current={current_status['reason']}, best={best_status['reason']}, "
+                        f"staged={staged_status['reason']}"
                     ),
                 }
             )
@@ -399,90 +550,29 @@ class TritonOperatorTask(Task):
                 "metrics": attach_reward(metrics, cfg.reward_weights),
                 "selected_metrics_source": "not_run_missing_impl",
                 "used_best_metrics": False,
-                "verifier_input_manifest_sha256": input_manifest_digest,
                 "_has_impl": False,
                 "no_impl_retry_filter": True,
                 "no_impl_retry_failed": True,
                 "no_impl_retry_failed_reason": "missing_impl",
             }
 
-        # The agent controls the workspace and may replace output/verify with a
-        # symlink. Remove the whole known output subtree without following a
-        # symlink argument, then recreate the verifier directory after process
-        # cleanup so stale or out-of-workspace JSON cannot satisfy attestation.
-        await _reset_verifier_output_dir(sandbox, workspace)
-
-        command = cfg.verify_command.format_map(
-            {"op_name": shlex.quote(op_name), "workspace_dir": shlex.quote(workspace)}
+        metrics = normalize_metrics(None, op_name=op_name)
+        metrics.update(
+            {
+                "success": False,
+                "compile_ok": False,
+                "correctness_ok": False,
+                "pass_rate": 0.0,
+                "error_type": "missing_metrics",
+                "error": "no reusable metrics_best, verifier artifacts, or metrics.json were found",
+            }
         )
-        result = await sandbox.exec_shell(command, timeout=cfg.verify_timeout, workdir=workspace)
-        # A trusted verifier must be synchronous, but enforce quiescence again
-        # before reading attestation/input digests in case it leaked children.
-        await self._cleanup_task_processes(sandbox, cfg, workspace, required=True)
-        verify = await _read_json(sandbox, f"{workspace}/output/verify/verify_result.json")
-        perf = await _read_json(sandbox, f"{workspace}/output/verify/perf_result.json")
-        inputs_intact = await _files_match(sandbox, expected_inputs)
-
-        attested_path, attested_digest = await _verified_implementation(sandbox, workspace, op_name, verify)
-        valid_counts = _verifier_case_counts_valid(verify)
-        substantive_digests = {
-            f"src/{op_name}_triton_ascend_impl.py": current_status["digest"] if current_status["substantive"] else None,
-            f"src/{op_name}_triton_ascend_impl_best.py": best_status["digest"] if best_status["substantive"] else None,
+        return {
+            "metrics": attach_reward(metrics, cfg.reward_weights),
+            "selected_metrics_source": "missing_metrics",
+            "used_best_metrics": False,
+            "_has_impl": True,
         }
-        attests_substantive_impl = bool(
-            attested_path and attested_digest and substantive_digests.get(attested_path) == attested_digest
-        )
-        attested = (
-            result.exit_code == 0
-            and attested_path is not None
-            and attested_digest is not None
-            and valid_counts
-            and attests_substantive_impl
-            and inputs_intact
-        )
-        attested_perf = _attested_perf(perf, workspace, attested_path, attested_digest) if attested else None
-        metrics = normalize_metrics(None, verify=verify, perf=attested_perf, op_name=op_name)
-        metrics["verify_exit_code"] = result.exit_code
-        metrics["verifier_attested"] = attested
-        metrics["perf_attested"] = bool(attested_perf)
-        metrics["verifier_inputs_intact"] = inputs_intact
-        metrics["verifier_input_manifest_sha256"] = input_manifest_digest
-        if attested:
-            metrics["verified_impl_path"] = attested_path
-            metrics["verified_impl_sha256"] = attested_digest
-        else:
-            metrics.update(
-                {
-                    "success": False,
-                    "compile_ok": False,
-                    "correctness_ok": False,
-                    "pass_rate": 0.0,
-                    "error_type": "untrusted_verifier_output",
-                    "error": (result.stderr or result.stdout).strip()[-512:]
-                    or (
-                        "final verifier did not emit a matching implementation attestation "
-                        "with positive, internally consistent case counts"
-                    ),
-                }
-            )
-        metrics = attach_reward(metrics, cfg.reward_weights)
-
-        used_best = bool(attested and attested_digest == best_impl_digest)
-        evaluation: dict[str, Any] = {
-            "metrics": metrics,
-            "selected_metrics_source": "final_verifier",
-            "used_best_metrics": used_best,
-            "verifier_input_manifest_sha256": input_manifest_digest,
-            "_has_impl": has_impl,
-        }
-        train_best = _train_best(
-            best or {},
-            "metrics_best",
-            best_impl_digest=attested_digest if used_best else None,
-        )
-        if train_best:
-            evaluation["train_best"] = train_best
-        return evaluation
 
     async def _collect_artifacts(
         self,
@@ -630,93 +720,6 @@ async def _validate_agent_verify_entrypoint(
         )
 
 
-async def _restore_verifier_inputs(
-    sandbox: Sandbox,
-    workspace: str,
-    metadata: dict[str, Any],
-    op_name: str,
-) -> dict[str, str]:
-    """Reset agent-visible verifier inputs after process cleanup and hash them."""
-
-    task_code = metadata.get("task_code")
-    if not isinstance(task_code, str) or not task_code.strip():
-        raise ValueError("task metadata requires non-empty task_code")
-    src_dir = f"{workspace}/src"
-    hidden_dir = f"{workspace}/.triton_case_sidecars"
-    src_check = await sandbox.exec_shell(
-        f"test -d {shlex.quote(src_dir)} && test ! -L {shlex.quote(src_dir)}",
-        timeout=10,
-    )
-    _require_success(src_check, "verifier source directory integrity check")
-    recreated = await sandbox.exec(["rm", "-rf", "--", hidden_dir], timeout=30)
-    _require_success(recreated, "stale hidden verifier input cleanup")
-    recreated = await sandbox.exec(["mkdir", "-p", hidden_dir], timeout=10)
-    _require_success(recreated, "hidden verifier input recreation")
-
-    files: dict[str, str | bytes] = {f"{src_dir}/{op_name}.py": task_code}
-    reserved = {
-        f"{op_name}.py",
-        f"{op_name}_triton_ascend_impl.py",
-        f"{op_name}_triton_ascend_impl_best.py",
-    }
-    for filename, content in _support_file_entries(metadata.get("support_files", [])):
-        safe_name = _support_filename(filename)
-        if safe_name in reserved:
-            raise ValueError(f"support file conflicts with a task/implementation path: {safe_name}")
-        if not isinstance(content, str | bytes):
-            raise TypeError(f"support file {safe_name!r} must contain text or bytes")
-        files[f"{src_dir}/{safe_name}"] = content
-        files[f"{hidden_dir}/{safe_name}"] = content
-    public_metadata = json.dumps(_public_metadata(metadata), ensure_ascii=False, indent=2) + "\n"
-    files[f"{workspace}/TASK_METADATA.json"] = public_metadata
-
-    expected: dict[str, str] = {}
-    for path, content in files.items():
-        raw = content.encode() if isinstance(content, str) else content
-        temporary = f"{path}.triton-restore"
-        removed = await sandbox.exec(["rm", "-f", "--", temporary], timeout=10)
-        _require_success(removed, f"temporary verifier input cleanup for {path}")
-        await sandbox.write_file(temporary, raw)
-        replaced = await sandbox.exec(["mv", "-f", "--", temporary, path], timeout=10)
-        _require_success(replaced, f"atomic verifier input reset for {path}")
-        expected[path] = hashlib.sha256(raw).hexdigest()
-    protected = await sandbox.exec(["chmod", "0444", *expected], timeout=10)
-    _require_success(protected, "verifier input protection")
-    return expected
-
-
-async def _reset_verifier_output_dir(sandbox: Sandbox, workspace: str) -> None:
-    output_dir = f"{workspace.rstrip('/')}/output"
-    removed = await sandbox.exec(["rm", "-rf", "--", output_dir], timeout=30)
-    _require_success(removed, "stale verifier output subtree cleanup")
-    created = await sandbox.exec(["mkdir", "-p", f"{output_dir}/verify"], timeout=10)
-    _require_success(created, "verifier output directory recreation")
-    checked = await sandbox.exec_shell(
-        " && ".join(
-            (
-                f"test -d {shlex.quote(output_dir)}",
-                f"test ! -L {shlex.quote(output_dir)}",
-                f"test -d {shlex.quote(output_dir)}/verify",
-                f"test ! -L {shlex.quote(output_dir)}/verify",
-            )
-        ),
-        timeout=10,
-    )
-    _require_success(checked, "verifier output directory integrity check")
-
-
-async def _files_match(sandbox: Sandbox, expected: dict[str, str]) -> bool:
-    for path, digest in expected.items():
-        if await _file_sha256(sandbox, path) != digest:
-            return False
-    return True
-
-
-def _digest_manifest(expected: dict[str, str]) -> str:
-    payload = "\n".join(f"{path}\0{digest}" for path, digest in sorted(expected.items()))
-    return hashlib.sha256(payload.encode()).hexdigest()
-
-
 def _require_success(result: ExecResult, operation: str) -> None:
     if result.exit_code != 0:
         detail = (result.stderr or result.stdout).strip()[-1000:]
@@ -780,6 +783,306 @@ async def _read_json(
     except (UnicodeDecodeError, json.JSONDecodeError, ValueError, RecursionError):
         return None
     return value if isinstance(value, dict) else None
+
+
+async def _read_early_stop(sandbox: Sandbox, workspace: str) -> dict[str, Any] | None:
+    value = await _read_json(sandbox, f"{workspace}/{_EARLY_STOP_PATH}", max_bytes=4096)
+    if not value or value.get("reason") not in {"no_verify_improvement", "no_latency_improvement"}:
+        return None
+    patience = value.get("patience")
+    stale = value.get("stale_verify_count")
+    verify_count = value.get("verify_count")
+    if (
+        not all(type(item) is int for item in (patience, stale, verify_count))
+        or not 0 < patience <= stale <= verify_count
+    ):
+        return None
+    return {
+        "reason": value["reason"],
+        "mode": value.get("mode"),
+        "patience": patience,
+        "stale_verify_count": stale,
+        "verify_count": verify_count,
+    }
+
+
+async def _plain_directory(sandbox: Sandbox, path: str) -> bool:
+    result = await sandbox.exec_shell(
+        f"test -d {shlex.quote(path)} && test ! -L {shlex.quote(path)}",
+        timeout=10,
+    )
+    if result.exit_code != 0:
+        return False
+    resolved = await sandbox.exec(["readlink", "-f", "--", path], timeout=10)
+    return resolved.exit_code == 0 and resolved.stdout.strip().rstrip("/") == path.rstrip("/")
+
+
+def _canonical_agent_metric_snapshot(metrics: dict[str, Any], *, op_name: str) -> dict[str, Any] | None:
+    claimed_op = metrics.get("op_name")
+    if claimed_op not in (None, "", op_name) or not _has_verify_signal(metrics):
+        return None
+    result = dict(metrics)
+    for key in ("reward", "reward_components", "reward_score", "all_correct_bonus"):
+        result.pop(key, None)
+    count_keys = ("total_cases", "passed_cases", "failed_cases")
+    if any(key in result for key in count_keys):
+        counts = _agent_time_case_counts(result)
+        if counts is None:
+            return None
+        total, passed, failed = counts
+        result.update(
+            {
+                "total_cases": total,
+                "passed_cases": passed,
+                "failed_cases": failed,
+                "pass_rate": round(passed / total, 6),
+                "correctness_ok": passed == total and failed == 0,
+                "success": passed == total and failed == 0,
+            }
+        )
+    else:
+        # Legacy flat files without counts may retain compile partial credit,
+        # but may not claim correctness or performance credit.
+        result.update(
+            {
+                "total_cases": 0,
+                "passed_cases": 0,
+                "failed_cases": 0,
+                "pass_rate": 0.0,
+                "correctness_ok": False,
+                "success": False,
+            }
+        )
+    passed = result["passed_cases"]
+    compile_ok = result.get("compile_ok") is True or result.get("output_observed") is True or passed > 0
+    result["compile_ok"] = compile_ok
+    result["output_observed"] = result.get("output_observed") is True or passed > 0
+    speedup = _strict_metric_speedup(result) if result["correctness_ok"] is True else None
+    for key in ("speedup_vs_torch", "speedup", "geomean_speedup", "perf_data"):
+        result.pop(key, None)
+    if speedup is not None:
+        result["perf_data"] = {"speedup": speedup}
+    return result
+
+
+def _strict_metric_speedup(metrics: dict[str, Any]) -> float | None:
+    containers = [metrics]
+    perf_data = metrics.get("perf_data")
+    if isinstance(perf_data, dict):
+        containers.append(perf_data)
+        implementation = perf_data.get("implementation")
+        if isinstance(implementation, dict):
+            containers.append(implementation)
+    for container in containers:
+        for key in ("speedup_vs_torch", "speedup", "geomean_speedup"):
+            if key not in container:
+                continue
+            value = container[key]
+            if isinstance(value, bool) or not isinstance(value, int | float):
+                return None
+            converted = float(value)
+            return converted if math.isfinite(converted) and converted >= 0 else None
+    return None
+
+
+def _metric_impl_binding(metrics: dict[str, Any], implementation_digest: str) -> str | None:
+    claims = [
+        metrics[key]
+        for key in ("assistant_snapshot_impl_sha256", "verified_impl_sha256", "implementation_sha256")
+        if key in metrics
+    ]
+    if not claims:
+        return "legacy_unbound"
+    if not implementation_digest or any(
+        not isinstance(claim, str) or claim.lower() != implementation_digest for claim in claims
+    ):
+        return None
+    return "matched"
+
+
+def _combined_metric_impl_binding(
+    snapshots: tuple[dict[str, Any] | None, ...],
+    implementation_digest: str,
+) -> str | None:
+    """Require every artifact digest claim to agree with the staged bytes."""
+
+    bindings = [_metric_impl_binding(item, implementation_digest) for item in snapshots if isinstance(item, dict)]
+    if any(binding is None for binding in bindings):
+        return None
+    return "matched" if "matched" in bindings else "legacy_unbound"
+
+
+async def _file_mtime(sandbox: Sandbox, path: str) -> int | None:
+    if await _regular_file_size(sandbox, path) is None:
+        return None
+    result = await sandbox.exec(["stat", "-c", "%Y", "--", path], timeout=10, env={"LC_ALL": "C"})
+    if result.exit_code != 0:
+        return None
+    try:
+        return int(result.stdout.strip())
+    except ValueError:
+        return None
+
+
+async def _staged_implementation_precedes_artifacts(
+    sandbox: Sandbox,
+    staged_path: str,
+    artifact_paths: tuple[str, ...],
+) -> bool:
+    """Keep the legacy guard against pairing newer source with older results."""
+
+    staged_mtime = await _file_mtime(sandbox, staged_path)
+    if staged_mtime is None:
+        return False
+    artifact_mtimes = [await _file_mtime(sandbox, path) for path in artifact_paths]
+    valid_mtimes = [mtime for mtime in artifact_mtimes if mtime is not None]
+    return bool(valid_mtimes) and staged_mtime <= max(valid_mtimes)
+
+
+def _has_verify_signal(metrics: dict[str, Any] | None) -> bool:
+    if not isinstance(metrics, dict):
+        return False
+    return any(
+        key in metrics
+        for key in (
+            "verified_success",
+            "verify_exit",
+            "total_cases",
+            "passed_cases",
+            "failed_cases",
+            "pass_rate",
+            "compile_ok",
+            "correctness_ok",
+        )
+    )
+
+
+def _agent_time_case_counts(verify: dict[str, Any] | None) -> tuple[int, int, int] | None:
+    if not isinstance(verify, dict):
+        return None
+    values = tuple(verify.get(key) for key in ("total_cases", "passed_cases", "failed_cases"))
+    if any(isinstance(value, bool) or not isinstance(value, int) for value in values):
+        return None
+    total, passed, failed = values
+    if total <= 0 or passed < 0 or failed < 0 or passed + failed != total:
+        return None
+    return total, passed, failed
+
+
+def _agent_time_output_observed(verify: dict[str, Any], passed: int) -> bool:
+    if passed > 0:
+        return True
+    failures = verify.get("failures")
+    if not isinstance(failures, list):
+        return False
+    markers = (
+        "输出不一致",
+        "输出形状不一致",
+        "NaN 位置不匹配",
+        "Inf 位置",
+        "布尔值不匹配",
+        "output shape",
+        "MERE=",
+        "MARE=",
+        "compare(fw_out, impl_out",
+    )
+    return any(marker in str(failure) for failure in failures for marker in markers)
+
+
+def _metrics_from_agent_verify_artifacts(
+    *,
+    op_name: str,
+    summary: dict[str, Any] | None,
+    verify: dict[str, Any] | None,
+    perf: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Normalize the legacy verify_once.sh artifacts without rerunning it."""
+
+    counts = _agent_time_case_counts(verify)
+    if counts is None or verify is None:
+        return None
+    total, passed, failed = counts
+    summary_perf = summary.get("perf_data") if isinstance(summary, dict) else None
+    perf_data = perf if isinstance(perf, dict) else summary_perf if isinstance(summary_perf, dict) else None
+    compile_raw = verify.get("compile_ok")
+    output_raw = verify.get("output_observed")
+    output_observed = (
+        output_raw if type(output_raw) is bool else bool(perf_data) or _agent_time_output_observed(verify, passed)
+    )
+    compile_ok = compile_raw if type(compile_raw) is bool else output_observed
+    if passed > 0:
+        compile_ok = True
+        output_observed = True
+    correctness_ok = passed == total and failed == 0
+    metrics: dict[str, Any] = {
+        "op_name": op_name,
+        "success": correctness_ok,
+        "ast_check_ok": True,
+        "compile_ok": compile_ok,
+        "output_observed": output_observed,
+        "correctness_ok": correctness_ok,
+        "total_cases": total,
+        "passed_cases": passed,
+        "failed_cases": failed,
+        "pass_rate": round(passed / total, 6),
+    }
+    speedup = _strict_metric_speedup({"perf_data": perf_data}) if correctness_ok and perf_data else None
+    if speedup is not None:
+        metrics["perf_data"] = {"speedup": speedup}
+    if not correctness_ok:
+        metrics["error_type"] = "compilation_failed" if not compile_ok else "correctness_failed"
+    return metrics
+
+
+async def _recover_agent_time_best(
+    sandbox: Sandbox,
+    workspace: str,
+    op_name: str,
+    *,
+    staged_impl_path: str,
+    staged_digest: str,
+    metrics: dict[str, Any],
+) -> bool:
+    """Recreate the legacy best pair from the implementation staged by verify_once."""
+
+    staged = await _read_regular_file(
+        sandbox,
+        staged_impl_path,
+        max_bytes=_MAX_IMPLEMENTATION_BYTES,
+    )
+    if staged is None or hashlib.sha256(staged).hexdigest() != staged_digest:
+        return False
+    best_path = f"{workspace}/src/{op_name}_triton_ascend_impl_best.py"
+    metrics_path = f"{workspace}/metrics_best.json"
+    temporary_best = f"{best_path}.triton-recover"
+    temporary_metrics = f"{metrics_path}.triton-recover"
+    snapshot = {
+        **metrics,
+        "implementation_path": f"src/{op_name}_triton_ascend_impl_best.py",
+        "implementation_sha256": staged_digest,
+    }
+    try:
+        removed = await sandbox.exec(["rm", "-f", "--", temporary_best, temporary_metrics], timeout=10)
+        _require_success(removed, "stale agent-time recovery temporary cleanup")
+        await sandbox.write_file(temporary_best, staged)
+        await sandbox.write_file(
+            temporary_metrics,
+            json.dumps(snapshot, ensure_ascii=False, allow_nan=False, separators=(",", ":")) + "\n",
+        )
+        moved = await sandbox.exec(["mv", "-f", "--", temporary_best, best_path], timeout=10)
+        _require_success(moved, "agent-time best implementation recovery")
+        moved = await sandbox.exec(["mv", "-f", "--", temporary_metrics, metrics_path], timeout=10)
+        _require_success(moved, "agent-time best metrics recovery")
+    except (TypeError, ValueError):
+        return False
+    recovered = await _read_regular_file(sandbox, best_path, max_bytes=_MAX_IMPLEMENTATION_BYTES)
+    recovered_metrics = await _read_json(sandbox, metrics_path)
+    return bool(
+        recovered is not None
+        and hashlib.sha256(recovered).hexdigest() == staged_digest
+        and isinstance(recovered_metrics, dict)
+        and _metric_impl_binding(recovered_metrics, staged_digest) == "matched"
+    )
 
 
 async def _file_sha256(
@@ -885,97 +1188,6 @@ def _is_stub_statement(statement: ast.stmt) -> bool:
     return False
 
 
-def _verifier_case_counts_valid(verify: dict[str, Any] | None) -> bool:
-    if not isinstance(verify, dict):
-        return False
-    values = [verify.get(key) for key in ("total_cases", "passed_cases", "failed_cases")]
-    if any(isinstance(value, bool) or not isinstance(value, int) for value in values):
-        return False
-    total, passed, failed = values
-    counts_valid = total > 0 and 0 <= passed <= total and 0 <= failed <= total and passed + failed == total
-    if not counts_valid or type(verify.get("compile_ok")) is not bool:
-        return False
-    if passed > 0 and verify["compile_ok"] is not True:
-        return False
-    for optional_bool in ("correctness_ok", "output_observed"):
-        if optional_bool in verify and type(verify[optional_bool]) is not bool:
-            return False
-    if "correctness_ok" in verify and verify["correctness_ok"] != (passed == total and failed == 0):
-        return False
-    return True
-
-
-def _attested_perf(
-    perf: dict[str, Any] | None,
-    workspace: str,
-    attested_path: str | None,
-    attested_digest: str | None,
-) -> dict[str, Any] | None:
-    """Accept finite performance data only when bound to the verified bytes."""
-
-    if not isinstance(perf, dict) or not attested_path or not attested_digest:
-        return None
-    claimed_path = str(perf.get("verified_impl_path") or "")
-    allowed_paths = {
-        attested_path,
-        f"./{attested_path}",
-        f"{workspace.rstrip('/')}/{attested_path}",
-    }
-    if claimed_path not in allowed_paths or str(perf.get("verified_impl_sha256") or "").lower() != attested_digest:
-        return None
-    containers = [perf]
-    implementation = perf.get("implementation")
-    if isinstance(implementation, dict):
-        containers.append(implementation)
-    for container in containers:
-        for key in ("speedup_vs_torch", "speedup", "geomean_speedup"):
-            value = container.get(key)
-            if isinstance(value, bool) or not isinstance(value, int | float):
-                continue
-            speedup = float(value)
-            if math.isfinite(speedup) and speedup >= 0:
-                return perf
-    return None
-
-
-async def _verified_implementation(
-    sandbox: Sandbox,
-    workspace: str,
-    op_name: str,
-    verify: dict[str, Any] | None,
-) -> tuple[str | None, str | None]:
-    """Validate the trusted final verifier's path + content digest attestation."""
-
-    if not isinstance(verify, dict):
-        return None, None
-    claimed_path = str(verify.get("verified_impl_path") or "")
-    claimed_digest = str(verify.get("verified_impl_sha256") or "").lower()
-    allowed_relative = {
-        f"src/{op_name}_triton_ascend_impl.py",
-        f"src/{op_name}_triton_ascend_impl_best.py",
-    }
-    if claimed_path.startswith(f"{workspace.rstrip('/')}/"):
-        relative = claimed_path[len(workspace.rstrip("/")) + 1 :]
-    elif claimed_path.startswith("./"):
-        relative = claimed_path[2:]
-    else:
-        relative = claimed_path
-    relative_path = PurePosixPath(relative)
-    if relative_path.is_absolute() or ".." in relative_path.parts:
-        return None, None
-    relative = relative_path.as_posix()
-    if relative not in allowed_relative or not re.fullmatch(r"[0-9a-f]{64}", claimed_digest):
-        return None, None
-    actual_digest = await _nonempty_file_sha256(
-        sandbox,
-        f"{workspace}/{relative}",
-        max_bytes=_MAX_IMPLEMENTATION_BYTES,
-    )
-    if actual_digest != claimed_digest:
-        return None, None
-    return relative, actual_digest
-
-
 def _train_best(
     metrics: dict[str, Any],
     source: str,
@@ -1025,13 +1237,10 @@ def _compact_extra_info(
             "pass_rate",
             "reward",
             "reward_components",
-            "verify_exit_code",
-            "verifier_attested",
-            "perf_attested",
-            "verifier_inputs_intact",
-            "verifier_input_manifest_sha256",
-            "verified_impl_path",
-            "verified_impl_sha256",
+            "agent_time_metrics_reused",
+            "metrics_impl_path",
+            "metrics_impl_sha256",
+            "metrics_impl_binding",
             "error_type",
         )
         if key in metrics
@@ -1062,6 +1271,7 @@ def _compact_extra_info(
         "timing_ms": evaluation.get("timing_ms", {}),
     }
     for key in (
+        "best_source",
         "train_best",
         "no_impl_retry_used",
         "no_impl_retry_attempts",
