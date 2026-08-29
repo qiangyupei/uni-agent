@@ -304,6 +304,7 @@ rollout_rs_threshold=${ROLLOUT_RS_THRESHOLD:-null}
   actor_rollout_ref.nccl_timeout=9600 \
   actor_rollout_ref.rollout.enforce_eager=False \
   actor_rollout_ref.rollout.free_cache_engine=True \
+  ++actor_rollout_ref.rollout.engine_kwargs.vllm.disable_custom_all_reduce=True \
   actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=1 \
   actor_rollout_ref.ref.log_prob_use_dynamic_bsz=${use_dynamic_bsz} \
   actor_rollout_ref.ref.log_prob_max_token_len_per_gpu=${infer_ppo_max_token_len} \
