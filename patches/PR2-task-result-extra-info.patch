@@ -1,0 +1,197 @@
+From 88409220c257d7663e972d4b97c586abca8668ef Mon Sep 17 00:00:00 2001
+From: qiangyupei <492261796@qq.com>
+Date: Thu, 20 Aug 2026 16:20:41 +0800
+Subject: [PATCH] [framework, docs] feat: forward bounded TaskResult metadata
+
+---
+ .../concepts/gateway-and-trajectories.md      |  4 ++
+ docs/source/concepts/task-and-reward.md       | 10 +++
+ tests/uni_agent/framework/test_task_runner.py | 62 +++++++++++++++++++
+ uni_agent/framework/task_runner.py            | 45 ++++++++++++++
+ 4 files changed, 121 insertions(+)
+
+diff --git a/docs/source/concepts/gateway-and-trajectories.md b/docs/source/concepts/gateway-and-trajectories.md
+index 090b8e7..4651f27 100644
+--- a/docs/source/concepts/gateway-and-trajectories.md
++++ b/docs/source/concepts/gateway-and-trajectories.md
+@@ -99,6 +99,10 @@ The built-in Task Runner posts:
+ }
+ ```
+ 
++With `report_reward=true`, the Task Runner can also forward bounded,
++use-case-specific metadata through `TaskResult.extra_info`; see
++[TaskResult metadata](task-and-reward.md#taskresult-metadata).
++
+ The Agent Framework reads the session reward, applies it to finalized trajectories, and writes a sparse token-level `rm_scores` tensor with the reward on the final token.
+ 
+ Agent completion is factual session metadata; the Framework, not the Task, decides how training consumes it. When the training configuration enables `mask_unfinished_episode`, a session with `finished=false` is still written and tagged as successful, but its TransferQueue `response_mask` and `loss_mask` are all zero so it does not contribute policy gradients, loss-normalization counts, or auxiliary losses.
+diff --git a/docs/source/concepts/task-and-reward.md b/docs/source/concepts/task-and-reward.md
+index 4c35325..3c02b48 100644
+--- a/docs/source/concepts/task-and-reward.md
++++ b/docs/source/concepts/task-and-reward.md
+@@ -160,6 +160,16 @@ training. The Agent Framework owns that policy through
+ inference, evaluation, and different training runs without embedding optimizer
+ behavior in the Task or dataset.
+ 
++### TaskResult metadata
++
++With the `report_reward=true` option, the generic Task Runner merges
++non-reserved `TaskResult.extra_info` fields into the session's `reward_info`.
++`reward`, `acc`, and `finished` remain canonical; colliding fields are ignored.
++The forwarded fields must be JSON serializable and at most 64 KiB after
++serialization. Otherwise, they are omitted with a warning while the canonical
++fields remain in the reward payload. Use this channel for compact metrics and
++labels, not logs or artifacts.
++
+ ## Dataset Contract
+ 
+ Preprocessing should serialize the sample-specific Task configuration into each dataset row:
+diff --git a/tests/uni_agent/framework/test_task_runner.py b/tests/uni_agent/framework/test_task_runner.py
+index eb26031..982394e 100644
+--- a/tests/uni_agent/framework/test_task_runner.py
++++ b/tests/uni_agent/framework/test_task_runner.py
+@@ -1,7 +1,11 @@
++import json
++import logging
++
+ import pytest
+ 
+ from uni_agent.framework import task_runner
+ from uni_agent.framework.task_runner import (
++    _MAX_TASK_RESULT_EXTRA_INFO_BYTES,
+     _extract_upstream,
+     _inject_gateway_tunnel,
+     _reward_info_from_result,
+@@ -133,3 +137,61 @@ async def test_run_task_binds_raw_prompt_to_sample_task_config(monkeypatch, tmp_
+     )
+ 
+     assert captured["config"].prompt == source_prompt
++
++
++def test_reward_info_forwards_extra_info_without_replacing_reserved_keys(caplog):
++    result = TaskResult(
++        reward=0.75,
++        accuracy=1.0,
++        finished=True,
++        extra_info={
++            "reward": 99,
++            "acc": 0,
++            "finished": False,
++            "train_best": 3,
++            "verifier": {"passed": True, "speedup": 1.25},
++        },
++    )
++
++    with caplog.at_level(logging.WARNING):
++        reward_info = _reward_info_from_result(result)
++
++    assert reward_info == {
++        "reward": 0.75,
++        "acc": 1.0,
++        "finished": True,
++        "train_best": 3,
++        "verifier": {"passed": True, "speedup": 1.25},
++    }
++    assert "ignoring reserved TaskResult.extra_info keys: acc, finished, reward" in caplog.text
++
++
++@pytest.mark.parametrize("extra_info", [{"invalid": object()}, {"not_finite": float("nan")}])
++def test_reward_info_omits_invalid_extra_info(extra_info, caplog):
++    result = TaskResult(reward=0.5, extra_info=extra_info)
++
++    with caplog.at_level(logging.WARNING):
++        assert _reward_info_from_result(result) == {"reward": 0.5}
++    assert "metadata must be JSON serializable" in caplog.text
++
++
++def test_reward_info_handles_json_recursion_error(monkeypatch):
++    def raise_recursion_error(*args, **kwargs):
++        raise RecursionError
++
++    monkeypatch.setattr(task_runner.json, "dumps", raise_recursion_error)
++    result = TaskResult(reward=0.5, extra_info={"nested": {}})
++
++    assert _reward_info_from_result(result) == {"reward": 0.5}
++
++
++def test_reward_info_enforces_serialized_size_limit():
++    oversized = TaskResult(reward=0.5, extra_info={"text": "x" * _MAX_TASK_RESULT_EXTRA_INFO_BYTES})
++    assert _reward_info_from_result(oversized) == {"reward": 0.5}
++
++    empty_payload_size = len(json.dumps({"text": ""}).encode("utf-8"))
++    at_limit = {"text": "x" * (_MAX_TASK_RESULT_EXTRA_INFO_BYTES - empty_payload_size)}
++    assert _reward_info_from_result(TaskResult(reward=0.5, extra_info=at_limit)) == {
++        "reward": 0.5,
++        **at_limit,
++    }
+diff --git a/uni_agent/framework/task_runner.py b/uni_agent/framework/task_runner.py
+index a5849e5..9af8785 100644
+--- a/uni_agent/framework/task_runner.py
++++ b/uni_agent/framework/task_runner.py
+@@ -3,6 +3,7 @@
+ 
+ from __future__ import annotations
+ 
++import json
+ import logging
+ from typing import TYPE_CHECKING, Any
+ from urllib.parse import urlparse
+@@ -15,6 +16,9 @@ if TYPE_CHECKING:
+ 
+ logger = logging.getLogger(__name__)
+ 
++_MAX_TASK_RESULT_EXTRA_INFO_BYTES = 64 * 1024
++_REWARD_INFO_RESERVED_KEYS = frozenset({"reward", "acc", "finished"})
++
+ 
+ def _rewrite_gateway_url(gateway_url: str, proxy_port: int) -> str:
+     """Rewrite a gateway URL to the sandbox-internal tunnel (``127.0.0.1:<proxy_port>``).
+@@ -168,4 +172,45 @@ def _reward_info_from_result(result: TaskResult) -> dict[str, Any]:
+         reward_info["acc"] = result.accuracy
+     if result.finished is not None:
+         reward_info["finished"] = result.finished
++
++    extra_info = result.extra_info
++    if extra_info is None:
++        return reward_info
++    if not isinstance(extra_info, dict):
++        logger.warning(
++            "omitting TaskResult.extra_info from reward_info: expected a dict, got %s",
++            type(extra_info).__name__,
++        )
++        return reward_info
++
++    conflicting_keys = sorted(_REWARD_INFO_RESERVED_KEYS.intersection(extra_info))
++    if conflicting_keys:
++        logger.warning(
++            "ignoring reserved TaskResult.extra_info keys: %s",
++            ", ".join(conflicting_keys),
++        )
++    forwarded_extra_info = {key: value for key, value in extra_info.items() if key not in _REWARD_INFO_RESERVED_KEYS}
++    if not forwarded_extra_info:
++        return reward_info
++
++    try:
++        serialized = json.dumps(forwarded_extra_info, allow_nan=False)
++    except (TypeError, ValueError, OverflowError, RecursionError) as exc:
++        logger.warning(
++            "omitting TaskResult.extra_info from reward_info: metadata must be JSON serializable (%s: %s)",
++            type(exc).__name__,
++            exc,
++        )
++        return reward_info
++
++    serialized_bytes = len(serialized.encode("utf-8"))
++    if serialized_bytes > _MAX_TASK_RESULT_EXTRA_INFO_BYTES:
++        logger.warning(
++            "omitting TaskResult.extra_info from reward_info: serialized metadata is %d bytes; limit is %d bytes",
++            serialized_bytes,
++            _MAX_TASK_RESULT_EXTRA_INFO_BYTES,
++        )
++        return reward_info
++
++    reward_info.update(forwarded_extra_info)
+     return reward_info
+-- 
+2.51.0.windows.2
+
