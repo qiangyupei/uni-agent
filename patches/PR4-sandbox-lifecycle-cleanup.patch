@@ -1,0 +1,369 @@
+From 6399469de76f2b5cf0a44a1664b423c0893fc75d Mon Sep 17 00:00:00 2001
+From: qiangyupei <492261796@qq.com>
+Date: Thu, 20 Aug 2026 18:09:08 +0800
+Subject: [PATCH] [sandbox, docs] fix: bound lifecycle cleanup
+
+---
+ docs/source/concepts/sandbox.md               |  11 +-
+ .../sandbox/test_lifecycle_cleanup.py         | 157 ++++++++++++++++++
+ uni_agent/sandbox/base.py                     |  70 +++++++-
+ uni_agent/sandbox/openyuanrong.py             |  15 +-
+ 4 files changed, 237 insertions(+), 16 deletions(-)
+ create mode 100644 tests/uni_agent/sandbox/test_lifecycle_cleanup.py
+
+diff --git a/docs/source/concepts/sandbox.md b/docs/source/concepts/sandbox.md
+index 6994ef1..8a11e2e 100644
+--- a/docs/source/concepts/sandbox.md
++++ b/docs/source/concepts/sandbox.md
+@@ -58,12 +58,19 @@ async with sandbox:
+     result = await sandbox.exec_shell("python --version")
+ ```
+ 
+-Entering the context starts the backend with retry, timeout, and global startup-concurrency controls. Exiting the context calls `stop()` even when the episode raises.
++Entering the context starts the backend with retry, timeout, and global
++startup-concurrency controls. Exiting the context calls `stop()` even when the
++episode raises or the caller is cancelled.
+ 
+ The shared lifecycle uses:
+ 
+ - `SANDBOX_STARTUP_TIMEOUT`: startup timeout, 600 seconds by default.
+ - `SANDBOX_STARTUP_CONCURRENCY`: process-wide startup limit, 64 by default.
++- `SANDBOX_STOP_TIMEOUT`: lifecycle cleanup timeout, 60 seconds by default.
++
++Lifecycle cleanup is shielded from cancellation and bounded by the stop timeout.
++A failed startup is retried only after its cleanup succeeds. Process-level hard
++kills cannot run Python cleanup, so remote providers still need a TTL or reaper.
+ 
+ Remote providers should implement `is_alive()` as a non-throwing health probe.
+ 
+@@ -148,6 +155,8 @@ The module is imported only when the provider is selected, so optional SDKs do n
+ 
+ - Implement `_exec()`, not `exec()`.
+ - Make `start()` and `stop()` safe to call during partial failures.
++- Do not discard provider handles until remote termination succeeds, so a
++  failed `stop()` remains retryable.
+ - Override `is_alive()` for remote providers.
+ - Extend `_is_timeout_error()` when the provider SDK uses custom timeout exceptions.
+ - Preserve `stdout`, `stderr`, and exit codes in `ExecResult`.
+diff --git a/tests/uni_agent/sandbox/test_lifecycle_cleanup.py b/tests/uni_agent/sandbox/test_lifecycle_cleanup.py
+new file mode 100644
+index 0000000..d2ed7a0
+--- /dev/null
++++ b/tests/uni_agent/sandbox/test_lifecycle_cleanup.py
+@@ -0,0 +1,157 @@
++from __future__ import annotations
++
++import asyncio
++from collections.abc import Awaitable, Callable
++
++import pytest
++
++from uni_agent.sandbox.base import ExecResult, Sandbox
++
++
++class _LifecycleSandbox(Sandbox):
++    def __init__(
++        self,
++        *,
++        start_impl: Callable[[], Awaitable[None]] | None = None,
++        stop_impl: Callable[[], Awaitable[None]] | None = None,
++    ) -> None:
++        self.start_impl = start_impl
++        self.stop_impl = stop_impl
++        self.start_calls = 0
++        self.stop_calls = 0
++
++    async def start(self) -> None:
++        self.start_calls += 1
++        if self.start_impl is not None:
++            await self.start_impl()
++
++    async def stop(self) -> None:
++        self.stop_calls += 1
++        if self.stop_impl is not None:
++            await self.stop_impl()
++
++    async def _exec(self, argv, *, timeout=None, workdir=None, env=None) -> ExecResult:
++        return ExecResult(exit_code=0, stdout="", stderr="")
++
++
++def test_context_cleanup_survives_cancellation() -> None:
++    async def assert_cleanup(use_entered: bool) -> None:
++        stop_started = asyncio.Event()
++        release_stop = asyncio.Event()
++        stopped = False
++
++        async def stop() -> None:
++            nonlocal stopped
++            stop_started.set()
++            await release_stop.wait()
++            stopped = True
++
++        sandbox = _LifecycleSandbox(stop_impl=stop)
++
++        async def use_sandbox() -> None:
++            context = sandbox.entered() if use_entered else sandbox
++            async with context:
++                pass
++
++        task = asyncio.create_task(use_sandbox())
++        await stop_started.wait()
++        task.cancel()
++        await asyncio.sleep(0)
++        assert not task.done()
++
++        release_stop.set()
++        with pytest.raises(asyncio.CancelledError):
++            await task
++        assert stopped
++        assert sandbox.stop_calls == 1
++
++    async def run() -> None:
++        await assert_cleanup(False)
++        await assert_cleanup(True)
++
++    asyncio.run(run())
++
++
++def test_stop_timeout_is_hard_bound(monkeypatch) -> None:
++    monkeypatch.setenv("SANDBOX_STOP_TIMEOUT", "0.01")
++
++    async def run() -> None:
++        release_stop = asyncio.Event()
++
++        async def stubborn_stop() -> None:
++            try:
++                await asyncio.Event().wait()
++            except asyncio.CancelledError:
++                await release_stop.wait()
++
++        sandbox = _LifecycleSandbox(stop_impl=stubborn_stop)
++        try:
++            with pytest.raises(TimeoutError, match="SANDBOX_STOP_TIMEOUT"):
++                await asyncio.wait_for(sandbox.__aexit__(None, None, None), timeout=0.5)
++        finally:
++            release_stop.set()
++            await asyncio.sleep(0)
++
++    asyncio.run(run())
++
++
++def test_start_cancellation_cleans_up_without_retry() -> None:
++    async def run() -> tuple[int, int]:
++        start_blocked = asyncio.Event()
++
++        async def start() -> None:
++            start_blocked.set()
++            await asyncio.Event().wait()
++
++        sandbox = _LifecycleSandbox(start_impl=start)
++        task = asyncio.create_task(sandbox.__aenter__(retry=3))
++        await start_blocked.wait()
++        task.cancel()
++        with pytest.raises(asyncio.CancelledError):
++            await task
++        return sandbox.start_calls, sandbox.stop_calls
++
++    assert asyncio.run(run()) == (1, 1)
++
++
++def test_failed_start_cleanup_prevents_retry() -> None:
++    async def fail_start() -> None:
++        raise RuntimeError("partial start")
++
++    async def fail_stop() -> None:
++        raise RuntimeError("cleanup failed")
++
++    sandbox = _LifecycleSandbox(start_impl=fail_start, stop_impl=fail_stop)
++    with pytest.raises(RuntimeError, match="cleanup failed"):
++        asyncio.run(sandbox.__aenter__(retry=3))
++    assert (sandbox.start_calls, sandbox.stop_calls) == (1, 1)
++
++
++def test_openyuanrong_stop_failure_keeps_handle_for_retry() -> None:
++    from uni_agent.sandbox.openyuanrong import OpenyuanrongSandbox
++
++    class Backend:
++        sandbox_id = "sandbox-123"
++
++        def __init__(self) -> None:
++            self.kill_calls = 0
++
++        def kill(self) -> None:
++            self.kill_calls += 1
++            if self.kill_calls == 1:
++                raise RuntimeError("provider unavailable")
++
++    async def run() -> None:
++        backend = Backend()
++        sandbox = OpenyuanrongSandbox(image="test-image")
++        sandbox._sandbox = backend
++
++        with pytest.raises(RuntimeError, match="provider unavailable"):
++            await sandbox.stop()
++        assert sandbox._sandbox is backend
++
++        await sandbox.stop()
++        assert sandbox._sandbox is None
++        assert backend.kill_calls == 2
++
++    asyncio.run(run())
+diff --git a/uni_agent/sandbox/base.py b/uni_agent/sandbox/base.py
+index ba6ee79..56eca49 100644
+--- a/uni_agent/sandbox/base.py
++++ b/uni_agent/sandbox/base.py
+@@ -5,6 +5,7 @@ import asyncio
+ import base64
+ import dataclasses
+ import logging
++import math
+ import os
+ import shlex
+ import tempfile
+@@ -194,6 +195,7 @@ class SandboxBackend(Protocol):
+ 
+ _DEFAULT_STARTUP_TIMEOUT = 600.0
+ _DEFAULT_STARTUP_CONCURRENCY = 64
++_DEFAULT_STOP_TIMEOUT = 60.0
+ # Per-process startup semaphores, created lazily per event loop so
+ # each binds to the loop that uses it and is *shared* across concurrent start()s.
+ _startup_semaphores: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
+@@ -211,6 +213,12 @@ def _env_number(name: str, default: float) -> float:
+         return default
+ 
+ 
++def _stop_timeout() -> float:
++    """Return the timeout for lifecycle-owned ``stop()`` calls."""
++    timeout = _env_number("SANDBOX_STOP_TIMEOUT", _DEFAULT_STOP_TIMEOUT)
++    return timeout if timeout > 0 and math.isfinite(timeout) else _DEFAULT_STOP_TIMEOUT
++
++
+ @asynccontextmanager
+ async def _startup_slot() -> AsyncIterator[None]:
+     """Hold one shared startup slot for the running loop (a no-op when ``<=0``).
+@@ -295,12 +303,59 @@ class Sandbox(abc.ABC):
+         except asyncio.TimeoutError as exc:
+             raise TimeoutError(f"sandbox start() exceeded SANDBOX_STARTUP_TIMEOUT={timeout:g}s") from exc
+ 
++    @staticmethod
++    def _consume_stop_result(task: asyncio.Task[None]) -> None:
++        """Consume the result of a stop task that outlived its lifecycle call."""
++        try:
++            task.result()
++        except asyncio.CancelledError:
++            pass
++        except BaseException as exc:
++            logger.error("sandbox stop() failed after timeout", exc_info=(type(exc), exc, exc.__traceback__))
++
++    async def _bounded_stop(self) -> None:
++        """Run ``stop()`` for at most ``SANDBOX_STOP_TIMEOUT`` seconds.
++
++        Waiting on the provider task explicitly keeps the deadline hard even if
++        the provider suppresses cancellation.
++        """
++        timeout = _stop_timeout()
++        stop_task = asyncio.create_task(self.stop())
++        done, _ = await asyncio.wait({stop_task}, timeout=timeout)
++        if stop_task not in done:
++            stop_task.cancel()
++            stop_task.add_done_callback(self._consume_stop_result)
++            raise TimeoutError(f"sandbox stop() exceeded SANDBOX_STOP_TIMEOUT={timeout:g}s")
++        await stop_task
++
++    async def _run_stop(self) -> None:
++        """Shield bounded cleanup, then propagate cancellation or cleanup failure.
++
++        Caller cancellation is delayed until ``stop()`` finishes or reaches its
++        own bound. A cleanup failure still takes precedence over cancellation.
++        """
++        cleanup_task = asyncio.create_task(self._bounded_stop())
++        cancellation: asyncio.CancelledError | None = None
++
++        while not cleanup_task.done():
++            try:
++                await asyncio.shield(cleanup_task)
++            except asyncio.CancelledError as exc:
++                if cleanup_task.cancelled():
++                    raise
++                cancellation = cancellation or exc
++
++        await cleanup_task
++        if cancellation is not None:
++            raise cancellation
++
+     async def __aenter__(self, retry: int = 3) -> Sandbox:
+         """Create the sandbox (retrying transient ``start()`` failures) and return it ready.
+ 
+         Each attempt holds one startup slot (``SANDBOX_STARTUP_CONCURRENCY``)
+         and is bounded by ``SANDBOX_STARTUP_TIMEOUT``; the slot is released before the
+-        retry backoff and the cleanup ``stop()``.
++        retry backoff and the cleanup ``stop()``. A retry is attempted only after
++        cleanup succeeds.
+         """
+         retry = max(1, retry)
+         last_exc: BaseException | None = None
+@@ -309,12 +364,11 @@ class Sandbox(abc.ABC):
+                 async with _startup_slot():
+                     await self._run_start()
+                 return self
+-            except Exception as exc:
++            except BaseException as exc:
++                await self._run_stop()
++                if not isinstance(exc, Exception):
++                    raise
+                 last_exc = exc
+-                try:
+-                    await self.stop()
+-                except Exception:
+-                    logger.warning("sandbox stop() failed during start() cleanup", exc_info=True)
+             logger.warning("sandbox failed to start (attempt %d/%d): %r", attempt, retry, last_exc)
+             if attempt < retry:
+                 await asyncio.sleep(2 * attempt)
+@@ -323,7 +377,7 @@ class Sandbox(abc.ABC):
+         raise last_exc
+ 
+     async def __aexit__(self, *exc) -> None:
+-        await self.stop()
++        await self._run_stop()
+ 
+     @asynccontextmanager
+     async def entered(self, **start_kwargs: Any) -> AsyncIterator[Sandbox]:
+@@ -331,7 +385,7 @@ class Sandbox(abc.ABC):
+         try:
+             yield self
+         finally:
+-            await self.stop()
++            await self._run_stop()
+ 
+     # ----- data plane: providers implement the _exec primitive -----
+     @abc.abstractmethod
+diff --git a/uni_agent/sandbox/openyuanrong.py b/uni_agent/sandbox/openyuanrong.py
+index 44edc4a..f1264d1 100644
+--- a/uni_agent/sandbox/openyuanrong.py
++++ b/uni_agent/sandbox/openyuanrong.py
+@@ -176,14 +176,15 @@ class OpenyuanrongSandbox(Sandbox):
+ 
+     async def stop(self) -> None:
+         """Kill the sandbox if still running."""
+-        if self._sandbox is not None:
+-            sid = getattr(self._sandbox, "sandbox_id", "?")
+-            try:
+-                await asyncio.to_thread(self._sandbox.kill)
+-                logger.info("openyuanrong sandbox %s killed", sid)
+-            except Exception as e:
+-                logger.warning("Failed to kill openyuanrong sandbox %s: %s", sid, e)
++        sandbox = self._sandbox
++        if sandbox is None:
++            return
++
++        sid = getattr(sandbox, "sandbox_id", "?")
++        await asyncio.to_thread(sandbox.kill)
++        if self._sandbox is sandbox:
+             self._sandbox = None
++        logger.info("openyuanrong sandbox %s killed", sid)
+ 
+     async def is_alive(self) -> bool:
+         sb = self._sandbox
+-- 
+2.51.0.windows.2
+
