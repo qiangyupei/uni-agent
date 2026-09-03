@@ -8,6 +8,10 @@ ARG SANDBOX_UID=1000
 ARG SANDBOX_GID=1000
 USER root
 
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends procps \
+    && rm -rf /var/lib/apt/lists/*
+
 COPY template/ /opt/triton-agent-template/
 COPY tools/ /opt/triton-agent-tools/
 
