@@ -7,7 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from ..prepare_data import (
+from uni_agent.tasks.kernel_bench.preprocess import (
     SourceRecord,
     add_drkernel_input_groups,
     assert_disjoint,

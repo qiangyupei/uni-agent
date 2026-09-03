@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from ..reward import attach_reward, normalize_metrics
+from uni_agent.tasks.kernel_bench.reward import attach_reward, normalize_metrics
 
 
 def test_partial_correctness_and_speedup_reward() -> None:

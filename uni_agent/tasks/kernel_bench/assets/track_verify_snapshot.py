@@ -1,4 +1,4 @@
-"""Claude Code hook: bind verifier best snapshots and stop stale searches.
+"""KernelBench Claude Code hook: bind best snapshots and stop stale searches.
 
 The command receives Claude Code's hook JSON on stdin. ``pre`` records the
 current transcript assistant count and best snapshot; ``post`` binds an updated

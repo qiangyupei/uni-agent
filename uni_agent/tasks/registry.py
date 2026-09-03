@@ -25,6 +25,7 @@ TASK_MODULES: dict[str, str] = {
     "swe_rebench": "uni_agent.tasks.swe_rebench.task",
     "hotpotqa": "uni_agent.tasks.hotpotqa.task",
     "terminal_bench": "uni_agent.tasks.terminal_bench.task",
+    "triton_operator": "uni_agent.tasks.kernel_bench.task",
 }
 
 

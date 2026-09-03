@@ -2,11 +2,13 @@
 
 The adapter has two intentionally small responsibilities:
 
-* import :mod:`task` so the example-local task is registered; and
-* bind this session to a remote Docker host.
+* import the example-local remote Docker provider; and
+* bind this session to a remote Docker host and NPU lock namespace.
 
 Task construction, reward reporting, and ``TaskResult.extra_info`` validation
-remain owned by :func:`uni_agent.framework.task_runner.run_task`.
+remain owned by :func:`uni_agent.framework.task_runner.run_task`; the
+``triton_operator`` Task is loaded lazily from
+:mod:`uni_agent.tasks.kernel_bench.task`.
 """
 
 from __future__ import annotations
@@ -19,7 +21,6 @@ if TYPE_CHECKING:
     from uni_agent.gateway.session import SessionHandle
 
 from . import remote_docker as _remote_docker  # noqa: F401 - registers the recipe provider
-from . import task as _task  # noqa: F401 - import registers ``triton_operator``
 from .network import bind_remote_sandbox, parse_device_ids
 
 

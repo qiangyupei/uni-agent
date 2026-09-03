@@ -1,7 +1,7 @@
 {
   "name": "uni-agent-triton-synthetic-smoke",
   "revision": "recipe-v1",
-  "source_url": "repo://examples/blackbox_recipes/triton_agent/fixtures/synthetic",
+  "source_url": "repo://examples/triton_agent/fixtures/synthetic",
   "sha256": "f7dd77c849b43a0fdf87b436bae3e2b18125b5d6df825cb55fd1a2ac0ae7b6d5",
   "license": "Apache-2.0",
   "license_url": "repo://LICENSE",

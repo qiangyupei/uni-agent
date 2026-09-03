@@ -1,4 +1,4 @@
-"""Per-session NPU operator task using Uni-Agent Task/Sandbox/ClaudeCodeAgent."""
+"""KernelBench task using Uni-Agent Task, Sandbox, and Claude Code APIs."""
 
 from __future__ import annotations
 

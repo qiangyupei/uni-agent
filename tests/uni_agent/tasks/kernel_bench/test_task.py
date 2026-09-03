@@ -12,8 +12,7 @@ pytest.importorskip("pydantic")
 
 from uni_agent.agents import AgentResult
 from uni_agent.sandbox import ExecResult
-
-from ..task import (
+from uni_agent.tasks.kernel_bench.task import (
     TritonOperatorTask,
     TritonOperatorTaskConfig,
     _implementation_status,

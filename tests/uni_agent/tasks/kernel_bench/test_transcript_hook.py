@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from ..assets.track_verify_snapshot import post, pre
+from uni_agent.tasks.kernel_bench.assets.track_verify_snapshot import post, pre
 
 
 def hook_payload(workspace: Path, transcript: Path) -> dict:

@@ -1,3 +1,7 @@
+# KernelBench defaults layered under each prepared sample by TaskConfigResolver.
+# The Task is uni_agent.tasks.kernel_bench.task.TritonOperatorTask; Claude Code
+# is loaded from the existing uni_agent.agents.claude_code package. Its endpoint,
+# API key, and model name are injected from the live Gateway session.
 - name: triton_operator
   sandbox:
     provider: triton_remote_docker
@@ -23,10 +27,6 @@
     run_timeout: 9000
     extra_args:
       - --disable-slash-commands
-    model:
-      temperature: 1.0
-      top_p: 1.0
-      max_total_tokens: 131072
   workspace_dir: /workspace
   template_dir: /opt/triton-agent-template
   setup_timeout: 120

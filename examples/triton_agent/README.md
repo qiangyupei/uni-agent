@@ -2,13 +2,40 @@
 
 This example migrates the NPU operator task and training-trajectory behavior to
 the stock Uni-Agent Task, Sandbox, Gateway, and Claude Code APIs. It targets
-Uni-Agent `3cbaecc4dc5175fbde61e6cb5d4336a75a7035e4` plus the `verl` v0.9.0
+Uni-Agent `28174fdab3787d307ae3a96d32d3737b600575a0` plus the `verl` v0.9.0
 submodule (`483b8a009ba3a97563edee3a19887e4862b8094a`). It intentionally contains no
 custom Gateway, KV-cache router, Megatron, checkpoint, debug, Claude protocol
 shim, or NPU-memory patches.
 
 See `MIGRATION.md` for the exact scope matrix, old/new behavior differences,
 NPU-memory audit, external blockers, and verification ledger.
+
+The reusable Task, reward, preprocessing, and transcript-hook code lives in
+`uni_agent/tasks/kernel_bench`. The `examples/triton_agent` directory contains
+only recipe configuration, launchers, remote-sandbox bindings, and deployment
+assets. The Task builds Uni-Agent's existing `claude_code` agent; no
+recipe-local Agent or protocol shim is used.
+
+## Layout
+
+```text
+uni_agent/tasks/kernel_bench/
+  task.py                         # Task and TaskConfig
+  reward.py                       # metric normalization and reward
+  preprocess.py                   # dataset preparation
+  assets/track_verify_snapshot.py # Claude Code task hook
+
+examples/triton_agent/
+  task_config_kernel_bench.yaml   # agent, task, and sandbox defaults
+  runner.py                       # remote-host/NPU binding entry point
+  trajectory_processor.py         # best-prefix trajectory policy
+  run_train.sh                    # NPU training launcher
+  run_train_gpu.sh                # GPU training launcher
+  remote_docker.py, network.py    # recipe-specific sandbox glue
+```
+
+The package name is `kernel_bench`, while the registered Task and prepared-data
+route remain `triton_operator` for compatibility with existing datasets.
 
 ## Core patches
 
@@ -42,7 +69,8 @@ not an NPU rollout. A digest-pinned image remains a prerequisite.
 
 ## Runtime architecture
 
-Each rollout session invokes `TritonOperatorTask.run`. An attempt enters one
+Each rollout session invokes
+`uni_agent.tasks.kernel_bench.task.TritonOperatorTask.run`. An attempt enters one
 `Sandbox` async context, stages its task, launches the existing
 `ClaudeCodeAgent`, stops remaining task processes, selects the metrics produced
 by agent-time verifier calls, optionally downloads small artifacts, and exits
@@ -66,11 +94,16 @@ reverse tunnel. The Gateway must advertise an address reachable from every
 sandbox host. Multi-host assignment is a stable hash, not a capacity-aware
 scheduler or failover layer; remove unhealthy endpoints before a run or point
 the recipe at an independently operated Docker-compatible control plane.
+This task configuration must use `examples.triton_agent.runner.run_triton_task`,
+which imports and registers the example-local provider before delegating to the
+generic Task runner.
 
-The stock Gateway reward endpoint is not authenticated. The task runner uses
-the strict reward-delivery patch's `reward_post_strict=True`, so a failed runner-side reward POST aborts
-the session instead of consuming an earlier value, but fail-closed delivery is
-not endpoint authentication. Before any real training, give the runner a
+The stock Gateway reward endpoint is not authenticated. With the strict
+reward-delivery patch applied, the example's `reward_post_strict=True` makes a
+failed runner-side reward POST abort the session instead of consuming an earlier
+value. Without that patch, stock `run_task` ignores this optional runner argument
+and reward delivery remains best-effort. Fail-closed delivery is not endpoint
+authentication. Before any real training, give the runner a
 runner-only reward capability or enforce a network proxy/ACL that exposes only
 this session's `/v1/messages` route to the sandbox and denies direct Gateway
 reachability. Direct Docker-host networking does not prove that property.
@@ -104,7 +137,7 @@ testing remains mandatory.
 
 ## Sandbox image contract
 
-`config/task_config.yaml` expects every remote daemon to have the pinned image,
+`task_config_kernel_bench.yaml` expects every remote daemon to have the pinned image,
 the image to declare `WORKDIR /workspace`, the provider `cwd` to remain
 `/workspace`, and `/opt/triton-agent-template` to
 contain reviewed, redistributable assets. Replace its deliberately invalid
@@ -174,7 +207,8 @@ the Task selects results in the same order as the previous training code:
 
 The Task rejects oversized, malformed, non-finite, or symlink artifact files and
 checks implementation shape and available snapshot digests. Serialized reward
-fields in the workspace are ignored: `reward.py` recomputes
+fields in the workspace are ignored: `uni_agent.tasks.kernel_bench.reward`
+recomputes
 AST/compile/correctness/speedup components from the selected raw metrics, and a
 full pass is represented by pass rate one rather than a separate bonus.
 
@@ -238,7 +272,7 @@ default. The latest old training recipe selected all operation families except
 three known resource-heavy operators, so those exclusions are explicit:
 
 ```bash
-python examples/blackbox_recipes/triton_agent/prepare_data.py \
+python -m uni_agent.tasks.kernel_bench.preprocess \
   --train-source /data/reviewed/train \
   --validation-source /data/reviewed/validation \
   --dataset-name reviewed-npu-benchmark \
@@ -258,7 +292,7 @@ For the official DrKernel parquet layout (`training_*.parquet` plus
 `validation_level*.parquet`), use:
 
 ```bash
-python examples/blackbox_recipes/triton_agent/prepare_data.py \
+python -m uni_agent.tasks.kernel_bench.preprocess \
   --train-source /data/drkernel \
   --validation-source /data/drkernel \
   --dataset-name drkernel \
@@ -298,13 +332,13 @@ content. `dataset_summary.json` records the verified source/manifest digest and
 both generated output digests. To calculate a manifest value before a run:
 
 ```bash
-python -c "from pathlib import Path; from examples.blackbox_recipes.triton_agent.prepare_data import source_tree_sha256; print(source_tree_sha256([Path('/data/reviewed/train'), Path('/data/reviewed/validation')]))"
+python -c "from pathlib import Path; from uni_agent.tasks.kernel_bench.preprocess import source_tree_sha256; print(source_tree_sha256([Path('/data/reviewed/train'), Path('/data/reviewed/validation')]))"
 ```
 
 A two-row synthetic fixture validates the schema only:
 
 ```bash
-bash examples/blackbox_recipes/triton_agent/prepare_synthetic.sh
+bash examples/triton_agent/prepare_synthetic.sh
 ```
 
 ## Training
@@ -336,11 +370,13 @@ TLS credentials should be provisioned outside Hydra arguments and logs.
 Then start from the official NPU VeOmni/vLLM-Ascend environment, set the model
 and remote evaluator pool, and append cluster/model parallelism overrides:
 
-`RUNTIME_ENV` must make this repository importable on every Ray worker, either
-with a reviewed `working_dir`/package upload or by installing the exact recipe
-commit in the worker image. It must also make `TASK_CONFIG`, train/validation
-Parquet files, model paths, and runner-local artifact destinations resolve
-consistently across nodes; a driver-only checkout is insufficient for
+`RUNTIME_ENV` must ship this checkout as the Ray `working_dir`, or expose the
+same checkout root through both the worker `PYTHONPATH` and working directory.
+Installing only the `uni-agent` wheel is insufficient because the runner and
+trajectory processor intentionally live under `examples/triton_agent`, and the
+default `TASK_CONFIG` is relative to the repository root. Train/validation
+Parquet files, model paths, and runner-local artifact destinations must also
+resolve consistently across nodes; a driver-only checkout is insufficient for
 `dispatch_mode=ray_task`.
 
 Environment consumed inside Agent Runner tasks must also be declared in that
@@ -348,6 +384,7 @@ runtime-env file; setting it only on the `ray job submit` entrypoint does not
 reliably propagate it to Ray workers. For example:
 
 ```yaml
+working_dir: ./
 env_vars:
   SANDBOX_STARTUP_CONCURRENCY: "32"
   SANDBOX_STOP_TIMEOUT: "120"
@@ -363,7 +400,7 @@ EVALUATOR_NPU_COUNT=8 \
 EVALUATOR_NPU_DEVICE_IDS=0,1,2,3,4,5,6,7 \
 EVALUATOR_NPU_LOCK_DIR=/var/lock/triton-agent-npu \
 MAX_CONCURRENT_SESSIONS=8 \
-bash examples/blackbox_recipes/triton_agent/run_train.sh \
+bash examples/triton_agent/run_train.sh \
   actor_rollout_ref.actor.optim.lr=5e-7
 ```
 
@@ -374,7 +411,7 @@ stock verl 0.9 Megatron/V1 synchronous launcher:
 REMOTE_DOCKER_HOSTS=ssh://sandbox-user@npu-host-01,ssh://sandbox-user@npu-host-02 \
 EVALUATOR_NPU_DEVICE_IDS=0,1,2,3,4,5,6,7 \
 MODEL_PATH=/models/Qwen3-Coder-30B-A3B-Instruct \
-bash examples/blackbox_recipes/triton_agent/run_train_gpu.sh
+bash examples/triton_agent/run_train_gpu.sh
 ```
 
 `run_train_gpu.sh` changes only the training/rollout backend to NVIDIA
@@ -414,10 +451,11 @@ destruction; file size and download time are bounded.
 ## Checks
 
 ```bash
-python -m ruff check examples/blackbox_recipes/triton_agent
-python -m pytest -q examples/blackbox_recipes/triton_agent/tests
-bash -n examples/blackbox_recipes/triton_agent/run_train.sh
-bash -n examples/blackbox_recipes/triton_agent/run_train_gpu.sh
+python -m ruff check uni_agent/tasks/kernel_bench examples/triton_agent \
+  tests/uni_agent/tasks/kernel_bench
+python -m pytest -q tests/uni_agent/tasks/kernel_bench examples/triton_agent/tests
+bash -n examples/triton_agent/run_train.sh
+bash -n examples/triton_agent/run_train_gpu.sh
 ```
 
 The unit suite covers stable IDs and split leakage, reward normalization,
