@@ -1,8 +1,7 @@
 """Prepare deterministic, leakage-free KernelBench datasets.
 
-This script intentionally consumes already-reviewed local source trees. Dataset
-download, provenance, checksum, and licence metadata live in a separate manifest
-so unreviewed benchmark payloads are never silently vendored into Uni-Agent.
+This script consumes local source trees and emits datasets ready for training.
+An optional manifest can validate provenance for audited runs.
 """
 
 from __future__ import annotations
@@ -1023,9 +1022,9 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--train-source", type=Path, required=True)
     parser.add_argument("--validation-source", type=Path, required=True)
-    parser.add_argument("--dataset-name", required=True)
-    parser.add_argument("--dataset-revision", required=True)
-    parser.add_argument("--source-manifest", type=Path, required=True)
+    parser.add_argument("--dataset-name")
+    parser.add_argument("--dataset-revision", default="local")
+    parser.add_argument("--source-manifest", type=Path)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--format", choices=("parquet", "jsonl"), default="parquet")
     parser.add_argument("--arch", default="ascend910b1")
@@ -1057,12 +1056,15 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    manifest = validate_source_manifest(
-        args.source_manifest,
-        dataset_name=args.dataset_name,
-        dataset_revision=args.dataset_revision,
-        source_paths=[args.train_source, args.validation_source],
-    )
+    dataset_name = args.dataset_name or args.dataset_kind
+    manifest = None
+    if args.source_manifest:
+        manifest = validate_source_manifest(
+            args.source_manifest,
+            dataset_name=dataset_name,
+            dataset_revision=args.dataset_revision,
+            source_paths=[args.train_source, args.validation_source],
+        )
     if args.dataset_kind == "drkernel":
         levels = {int(value.strip()) for value in args.drkernel_validation_levels.split(",") if value.strip()} or None
         train_records = discover_drkernel_records(
@@ -1118,7 +1120,7 @@ def main() -> None:
     train, validation = rows_from_records(
         train_records,
         validation_records,
-        dataset_name=args.dataset_name,
+        dataset_name=dataset_name,
         dataset_revision=args.dataset_revision,
         arch=args.arch,
     )
@@ -1129,12 +1131,10 @@ def main() -> None:
     write_rows(validation, validation_output)
     summary = {
         "recipe_schema_version": _RECIPE_SCHEMA_VERSION,
-        "dataset_name": args.dataset_name,
+        "dataset_name": dataset_name,
         "dataset_revision": args.dataset_revision,
         "dataset_kind": args.dataset_kind,
         "arch": args.arch,
-        "source_manifest_sha256": hashlib.sha256(args.source_manifest.read_bytes()).hexdigest(),
-        "verified_source_sha256": manifest["verified_source_sha256"],
         "train_rows": len(train),
         "validation_rows": len(validation),
         "train_output_sha256": hashlib.sha256(train_output.read_bytes()).hexdigest(),
@@ -1144,6 +1144,9 @@ def main() -> None:
             "\n".join(sorted(row["uid"] for row in validation)).encode()
         ).hexdigest(),
     }
+    if manifest:
+        summary["source_manifest_sha256"] = hashlib.sha256(args.source_manifest.read_bytes()).hexdigest()
+        summary["verified_source_sha256"] = manifest["verified_source_sha256"]
     (args.output_dir / "dataset_summary.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
     print(json.dumps(summary, indent=2))
 

@@ -15,6 +15,7 @@ from uni_agent.tasks.kernel_bench.preprocess import (
     discover_drkernel_records,
     discover_records,
     filter_records,
+    main,
     select_benchmark_levels,
     select_records,
     source_tree_sha256,
@@ -112,6 +113,41 @@ def test_manifest_verifies_reviewed_source_tree_and_rejects_placeholders(tmp_pat
             dataset_revision="r1",
             source_paths=[train, validation],
         )
+
+
+def test_minimal_cli_prepares_training_data_without_manifest(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    train = tmp_path / "train"
+    validation = tmp_path / "validation"
+    output = tmp_path / "output"
+    write_task(train, "level1/add", "REFERENCE = 'add'\n")
+    write_task(validation, "level1/mul", "REFERENCE = 'mul'\n")
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "preprocess",
+            "--train-source",
+            str(train),
+            "--validation-source",
+            str(validation),
+            "--output-dir",
+            str(output),
+            "--format",
+            "jsonl",
+        ],
+    )
+
+    main()
+
+    summary = json.loads((output / "dataset_summary.json").read_text(encoding="utf-8"))
+    assert summary["dataset_name"] == "npukernelbench"
+    assert summary["dataset_revision"] == "local"
+    assert "source_manifest_sha256" not in summary
+    assert (output / "train.jsonl").is_file()
+    assert (output / "validation.jsonl").is_file()
 
 
 def test_split_check_rejects_renamed_content(tmp_path: Path) -> None:
