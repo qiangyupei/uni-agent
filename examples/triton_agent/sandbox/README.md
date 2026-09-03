@@ -9,39 +9,28 @@ image:
 - the Dockerfile links the workspace verifier entry point and verifier scripts
   back to that immutable tools directory.
 
-Build a derived image without overwriting the base tag:
+Build the image referenced by the example task configuration:
 
 ```bash
 cd examples/triton_agent/sandbox
-bash build_image.sh
+OUTPUT_IMAGE=triton-claude-code-env:new bash build_image.sh
 ```
 
-This produces `triton-claude-code-env:kernel-bench` for inspection. Either use
-that tag in `task_config_kernel_bench.yaml`, or build the `latest` tag expected
-by the supplied task config as follows.
-
-To replace `triton-claude-code-env:latest`, first retain a base tag so a later
-build cannot accidentally inherit from its own output:
-
-```bash
-docker tag triton-claude-code-env:latest triton-claude-code-env:base
-BASE_IMAGE=triton-claude-code-env:base \
-OUTPUT_IMAGE=triton-claude-code-env:latest \
-bash build_image.sh
-```
+This copies the recipe assets from the local build context into the existing
+`triton-claude-code-env:latest` base image without downloading packages.
 
 Check the resulting image before rollout:
 
 ```bash
-docker run --rm --entrypoint bash triton-claude-code-env:latest -lc \
+docker run --rm --entrypoint bash triton-claude-code-env:new -lc \
   'test "$(id -u)" != 0 && test -x /opt/triton-agent-tools/verify_once.sh && test -d /opt/triton-agent-template'
 ```
 
-The base image must already contain Claude Code, Python, the Ascend runtime,
-torch/torch-npu, Triton Ascend, and the verifier's Python dependencies. The
-layer creates and selects a non-root `claude` user with UID/GID 1000 when it is
-missing. Override `SANDBOX_USER`, `SANDBOX_UID`, and `SANDBOX_GID` if those IDs
-are already assigned differently in the base image.
+The base image must already contain Claude Code, Python, `timeout`, the Ascend
+runtime, torch/torch-npu, Triton Ascend, the verifier's Python dependencies, and
+the non-root `claude` user. The derived layer only copies recipe files and sets
+their links and permissions. Set `SANDBOX_USER` when the existing user has a
+different name; the layer does not install packages or create users.
 
 Because the task uses `pull_policy: never`, build the same image on every
 Docker endpoint, or push it to a registry and pre-pull it on every endpoint.
