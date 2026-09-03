@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-set -xeuo pipefail
+set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="${REPO_ROOT:-$(cd "${SCRIPT_DIR}/../.." && pwd)}"
@@ -21,8 +21,8 @@ CKPTS_DIR=${CKPTS_DIR:-"${RAY_DATA_HOME}/ckpts/${project_name}/${exp_name}"}
 AGENT_LOG_DIR=${AGENT_LOG_DIR:-"${RAY_DATA_HOME}/logs/${project_name}/${exp_name}"}
 TRAIN_FILE=${TRAIN_FILE:-"${RAY_DATA_HOME}/data/triton_agent/train.parquet"}
 VAL_FILE=${VAL_FILE:-"${RAY_DATA_HOME}/data/triton_agent/validation.parquet"}
-RUNTIME_ENV=${RUNTIME_ENV:-"${RAY_DATA_HOME}/data/uni_agent/runtime_env.yaml"}
-RAY_BIN=${RAY_BIN:-ray}
+RUNTIME_ENV=${RUNTIME_ENV:-}
+WORKING_DIR=${WORKING_DIR:-"${REPO_ROOT}"}
 TASK_CONFIG=${TASK_CONFIG:-"${RECIPE_DIR}/task_config_kernel_bench.yaml"}
 TOOL_PARSER=${TOOL_PARSER:-qwen3_coder}
 GATEWAY_COUNT=${GATEWAY_COUNT:-2}
@@ -34,48 +34,12 @@ ROLLOUT_MODE=${ROLLOUT_MODE:-async}
 # Training/rollout uses NVIDIA GPUs. Operator verification runs in per-session
 # containers on the remote Ascend hosts below.
 REMOTE_DOCKER_HOSTS=${REMOTE_DOCKER_HOSTS:?set comma-separated Docker endpoints, preferably ssh://user@host}
-if [[ "${REMOTE_DOCKER_HOSTS}" == ,* || "${REMOTE_DOCKER_HOSTS}" == *, ||
-  "${REMOTE_DOCKER_HOSTS}" == *,,* ]]; then
-  echo "REMOTE_DOCKER_HOSTS cannot contain empty entries" >&2
-  exit 2
-fi
 IFS=',' read -r -a remote_docker_hosts <<<"${REMOTE_DOCKER_HOSTS}"
-
 EVALUATOR_NPU_DEVICE_IDS=${EVALUATOR_NPU_DEVICE_IDS:?set comma-separated evaluator NPU IDs}
 EVALUATOR_NPU_LOCK_DIR=${EVALUATOR_NPU_LOCK_DIR:-/var/lock/triton-agent-npu}
 EVALUATOR_NPU_LOCK_TIMEOUT=${EVALUATOR_NPU_LOCK_TIMEOUT:-1200}
-if [[ "${EVALUATOR_NPU_DEVICE_IDS}" == ,* || "${EVALUATOR_NPU_DEVICE_IDS}" == *, ||
-  "${EVALUATOR_NPU_DEVICE_IDS}" == *,,* ]]; then
-  echo "EVALUATOR_NPU_DEVICE_IDS cannot contain empty entries" >&2
-  exit 2
-fi
 IFS=',' read -r -a evaluator_devices <<<"${EVALUATOR_NPU_DEVICE_IDS}"
-declare -A seen_evaluator_devices=()
-for evaluator_device in "${evaluator_devices[@]}"; do
-  if [[ ! "${evaluator_device}" =~ ^[A-Za-z0-9_-]+$ ]]; then
-    echo "EVALUATOR_NPU_DEVICE_IDS contains an unsafe device ID: ${evaluator_device}" >&2
-    exit 2
-  fi
-  if [[ -n "${seen_evaluator_devices[${evaluator_device}]:-}" ]]; then
-    echo "EVALUATOR_NPU_DEVICE_IDS cannot contain duplicates: ${evaluator_device}" >&2
-    exit 2
-  fi
-  seen_evaluator_devices["${evaluator_device}"]=1
-done
-EVALUATOR_NPU_COUNT=${EVALUATOR_NPU_COUNT:-${#evaluator_devices[@]}}
-MAX_CONCURRENT_SESSIONS=${MAX_CONCURRENT_SESSIONS:-$((EVALUATOR_NPU_COUNT * ${#remote_docker_hosts[@]}))}
-if [[ ! "${EVALUATOR_NPU_COUNT}" =~ ^[1-9][0-9]*$ ]]; then
-  echo "EVALUATOR_NPU_COUNT must be a positive integer" >&2
-  exit 2
-fi
-if [[ ! "${MAX_CONCURRENT_SESSIONS}" =~ ^[1-9][0-9]*$ ]]; then
-  echo "MAX_CONCURRENT_SESSIONS must be a positive integer" >&2
-  exit 2
-fi
-if (( EVALUATOR_NPU_COUNT != ${#evaluator_devices[@]} )); then
-  echo "EVALUATOR_NPU_COUNT must match EVALUATOR_NPU_DEVICE_IDS" >&2
-  exit 2
-fi
+MAX_CONCURRENT_SESSIONS=${MAX_CONCURRENT_SESSIONS:-$((${#evaluator_devices[@]} * ${#remote_docker_hosts[@]}))}
 # Algorithm and sequence lengths.
 adv_estimator=${ADV_ESTIMATOR:-grpo}
 use_kl_in_reward=${USE_KL_IN_REWARD:-False}
@@ -127,22 +91,6 @@ train_pp=${PP:-1}
 train_cp=${CP:-8}
 train_ep=${EP:-8}
 train_etp=${ETP:-1}
-
-for topology_value in NNODES NGPUS_PER_NODE gen_tp train_tp train_pp train_cp train_ep train_etp; do
-  if (( ${!topology_value} < 1 )); then
-    echo "${topology_value} must be positive" >&2
-    exit 2
-  fi
-done
-world_size=$((NNODES * NGPUS_PER_NODE))
-if (( world_size % (train_tp * train_pp * train_cp) != 0 )); then
-  echo "world size must be divisible by TP * PP * CP for Megatron" >&2
-  exit 2
-fi
-if (( NGPUS_PER_NODE % gen_tp != 0 )); then
-  echo "NGPUS_PER_NODE must be divisible by GEN_TP for async vLLM" >&2
-  exit 2
-fi
 actor_ppo_max_token_len=${PPO_MAX_TOKEN_LEN_PER_GPU:-32768}
 infer_ppo_max_token_len=${LOG_PROB_MAX_TOKEN_LEN_PER_GPU:-${actor_ppo_max_token_len}}
 
@@ -170,8 +118,12 @@ rollout_is_batch_normalize=${ROLLOUT_IS_BATCH_NORMALIZE:-False}
 rollout_rs=${ROLLOUT_RS:-null}
 rollout_rs_threshold=${ROLLOUT_RS_THRESHOLD:-null}
 
-"${RAY_BIN}" job submit --no-wait --runtime-env "${RUNTIME_ENV}" \
-  -- env RAY_OVERRIDE_JOB_RUNTIME_ENV=1 \
+RUNTIME_ENV_ARGS=()
+if [[ -n "${RUNTIME_ENV}" ]]; then
+  RUNTIME_ENV_ARGS=(--runtime-env "${RUNTIME_ENV}")
+fi
+
+MAIN_CMD=(
   python3 -m verl.trainer.main_ppo \
   --config-name=ppo_megatron_trainer \
   trainer.use_v1=True \
@@ -340,3 +292,7 @@ rollout_rs_threshold=${ROLLOUT_RS_THRESHOLD:-null}
   trainer.n_gpus_per_node=${NGPUS_PER_NODE} \
   trainer.test_freq=${test_freq} \
   "$@"
+)
+
+ray job submit --no-wait --working-dir="${WORKING_DIR}" "${RUNTIME_ENV_ARGS[@]}" \
+  -- env RAY_OVERRIDE_JOB_RUNTIME_ENV=1 "${MAIN_CMD[@]}"

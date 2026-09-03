@@ -32,6 +32,7 @@ examples/triton_agent/
   run_train.sh                    # NPU training launcher
   run_train_gpu.sh                # GPU training launcher
   remote_docker.py, network.py    # recipe-specific sandbox glue
+  sandbox/                        # evaluator image layer and immutable tools
 ```
 
 The package name is `kernel_bench`, while the registered Task and prepared-data
@@ -44,6 +45,10 @@ patches under the repository-level `patches/` directory:
 
 1. the framework-level `trajectory_postprocessor_fqn` hook; and
 2. bounded, JSON-serializable `TaskResult.extra_info` reward forwarding.
+
+Those two patches are the minimum functional stack for the healthy training
+path. The remaining patches strengthen failure handling but are not required
+for initial bring-up.
 
 For a production run, also stack:
 
@@ -61,11 +66,11 @@ Without patches 3 and 4, the healthy path still creates, reports, and destroys
 the sandbox, but reward POST failures remain best-effort and cancellation
 cleanup has the stock lifecycle boundary.
 
-This repository does not redistribute benchmark payloads or the numerical CANN
-verifier and latency tools. Install the reviewed legacy-compatible
-`verify_once.sh` flow in the sandbox image and retain its original licence
-notices. The included tests exercise agent-time metric selection and fallback,
-not an NPU rollout. A digest-pinned image remains a prerequisite.
+Benchmark datasets are not vendored. The local image layer under `sandbox/`
+contains the legacy numerical verifier and selected skill material needed by
+the recipe; retain their headers and complete the licence review recorded in
+`sandbox/NOTICE.md` before redistribution. The included tests do not replace a
+real NPU rollout. Use a digest-pinned image for production.
 
 ## Runtime architecture
 
@@ -124,8 +129,8 @@ session's agent time budget, so tune `MAX_CONCURRENT_SESSIONS` to both Docker
 capacity and expected verifier contention.
 
 All remote Docker hosts are expected to expose the same configured device IDs.
-`EVALUATOR_NPU_COUNT` is therefore the per-host list length; the launcher's
-default session cap is that value times the number of configured hosts.
+The launcher's default session cap is the number of device IDs times the number
+of configured hosts.
 The runner mounts `EVALUATOR_NPU_LOCK_DIR` from the selected daemon host at the
 same path in each container. Containers on one physical host therefore share
 that host's device pool; different hosts use independent local files even when
@@ -137,12 +142,12 @@ testing remains mandatory.
 
 ## Sandbox image contract
 
-`task_config_kernel_bench.yaml` expects every remote daemon to have the pinned image,
-the image to declare `WORKDIR /workspace`, the provider `cwd` to remain
-`/workspace`, and `/opt/triton-agent-template` to
-contain reviewed, redistributable assets. Replace its deliberately invalid
-`REPLACE_WITH_PINNED_TRITON_AGENT_NPU_IMAGE_DIGEST` value with an immutable
-reviewed digest. Every attempt runs `pwd` without a
+`task_config_kernel_bench.yaml` uses `triton-claude-code-env:latest` for local
+bring-up. Build the supplied `sandbox/` layer on every remote Docker daemon;
+replace the mutable tag with an immutable reviewed digest for production. The
+image declares `WORKDIR /workspace`, the provider `cwd` remains `/workspace`,
+and `/opt/triton-agent-template` contains the fresh-workspace template. Every
+attempt runs `pwd` without a
 workdir override and fails before Claude starts unless it equals
 `workspace_dir`; this is required because the stock `ClaudeCodeAgent` correctly
 uses the sandbox process cwd rather than a recipe-specific launch path.
@@ -154,19 +159,21 @@ replace the verifier and invalidate reward trust.
 
 The template contains:
 
-- `INSTRUCTIONS.md`;
+- `CLAUDE.md`, `INSTRUCTIONS.md`, and selected Triton/NPU skills;
 - `tools/verify_once.sh`, a symlink to the immutable image command below;
-- protected verifier code and image-owned test inputs; and
-- a pinned Claude Code CLI release supporting `PostToolUseFailure` and universal
-  `continue: false` hook output (the stock agent can install Claude, but a pinned
-  image is reproducible and avoids runtime internet access).
+- a verifier `scripts` symlink to immutable image-owned code.
+
+The base `triton-claude-code-env` image must provide a pinned Claude Code CLI
+release supporting `PostToolUseFailure` and universal `continue: false` hook
+output. The stock agent can install Claude, but a pinned image is reproducible
+and avoids runtime internet access.
 
 The image must separately provide immutable, root-owned executables outside the
 agent workspace:
 
-- `/opt/triton-agent-tools/cleanup_task_processes.sh`, scoped to the session
-  cgroup/PIDs and required both immediately before final artifact selection and
-  in the attempt's `finally` cleanup;
+- `/opt/triton-agent-tools/cleanup_task_processes.sh`, which terminates
+  registered verifier process groups before final artifact selection and in the
+  attempt's `finally` cleanup;
 - `/opt/triton-agent-tools/verify_once.sh`, accepting one safe operator name
   and implementing the retained agent-time stage, correctness, benchmark, and
   best-snapshot flow; and
@@ -354,8 +361,18 @@ for device in 0 1 2 3 4 5 6 7; do
   sudo chown root:root "/var/lock/triton-agent-npu/device-${device}.lock"
   sudo chmod 0666 "/var/lock/triton-agent-npu/device-${device}.lock"
 done
-docker pull <reviewed-image@sha256:digest>
+
+cd /path/to/uni-agent/examples/triton_agent/sandbox
+docker tag triton-claude-code-env:latest triton-claude-code-env:base
+BASE_IMAGE=triton-claude-code-env:base \
+OUTPUT_IMAGE=triton-claude-code-env:latest \
+bash build_image.sh
 ```
+
+For a remote daemon, set `DOCKER_HOST=ssh://sandbox-user@npu-host-01` for the
+three Docker commands. Repeat for every entry in `REMOTE_DOCKER_HOSTS`, or push
+the derived image to a registry and pre-pull it on every daemon. See
+`sandbox/README.md` for details.
 
 Configure Docker-over-SSH access from every Ray node that may execute an Agent
 Runner, and verify it before training:
@@ -364,43 +381,48 @@ Runner, and verify it before training:
 docker --host ssh://sandbox-user@npu-host-01 info
 ```
 
+`REMOTE_DOCKER_HOSTS` is one comma-separated string of Docker `--host`
+endpoints, not a YAML or shell array. The recommended form is:
+
+```text
+ssh://sandbox-user@npu-host-01,ssh://sandbox-user@npu-host-02:2222
+```
+
+Use `unix:///var/run/docker.sock` for a daemon local to every runner process.
+An authenticated `tcp://host:2376` endpoint is also accepted by Docker, but its
+TLS environment and certificate files must be available to the Ray workers.
+Do not include empty entries; each endpoint must already contain the configured
+sandbox image and expose the same `EVALUATOR_NPU_DEVICE_IDS` list.
+
 Do not expose an unauthenticated Docker TCP daemon. SSH keys, host keys, and any
 TLS credentials should be provisioned outside Hydra arguments and logs.
 
 Then start from the official NPU VeOmni/vLLM-Ascend environment, set the model
 and remote evaluator pool, and append cluster/model parallelism overrides:
 
-`RUNTIME_ENV` must ship this checkout as the Ray `working_dir`, or expose the
-same checkout root through both the worker `PYTHONPATH` and working directory.
-Installing only the `uni-agent` wheel is insufficient because the runner and
-trajectory processor intentionally live under `examples/triton_agent`, and the
-default `TASK_CONFIG` is relative to the repository root. Train/validation
-Parquet files, model paths, and runner-local artifact destinations must also
-resolve consistently across nodes; a driver-only checkout is insufficient for
-`dispatch_mode=ray_task`.
+Both launchers locate the repository root from their own path and pass it to
+`ray job submit --working-dir`. This makes the example modules and relative
+`TASK_CONFIG` available to the Ray job without a separate runtime-env file, so
+the scripts may be launched directly from `examples/triton_agent`. The verl
+v0.9.0 environment should already be installed on the Ray image.
 
-Environment consumed inside Agent Runner tasks must also be declared in that
-runtime-env file; setting it only on the `ray job submit` entrypoint does not
-reliably propagate it to Ray workers. For example:
-
-```yaml
-working_dir: ./
-env_vars:
-  SANDBOX_STARTUP_CONCURRENCY: "32"
-  SANDBOX_STOP_TIMEOUT: "120"
-  # GPU deployments may also pin VERL_PLATFORM: nvidia here.
-```
+`RUNTIME_ENV` is optional and is only needed for deployment-specific packages
+or environment variables that must be propagated to Ray workers. Do not put a
+second `working_dir` in that file. The stock Sandbox startup-concurrency default
+normally needs no override; set `SANDBOX_STOP_TIMEOUT` there only when changing
+the lifecycle patch default.
 
 ```bash
+cd examples/triton_agent
+
 MODEL_PATH=/models/Qwen3-Coder-30B-A3B-Instruct \
 TRAIN_FILE=/data/triton-agent/train.parquet \
 VAL_FILE=/data/triton-agent/validation.parquet \
 REMOTE_DOCKER_HOSTS=ssh://sandbox-user@npu-host-01,ssh://sandbox-user@npu-host-02 \
-EVALUATOR_NPU_COUNT=8 \
 EVALUATOR_NPU_DEVICE_IDS=0,1,2,3,4,5,6,7 \
 EVALUATOR_NPU_LOCK_DIR=/var/lock/triton-agent-npu \
 MAX_CONCURRENT_SESSIONS=8 \
-bash examples/triton_agent/run_train.sh \
+bash run_train.sh \
   actor_rollout_ref.actor.optim.lr=5e-7
 ```
 
@@ -408,17 +430,19 @@ For NVIDIA training/rollout with the same remote Ascend verifier pool, use the
 stock verl 0.9 Megatron/V1 synchronous launcher:
 
 ```bash
+cd examples/triton_agent
+
 REMOTE_DOCKER_HOSTS=ssh://sandbox-user@npu-host-01,ssh://sandbox-user@npu-host-02 \
 EVALUATOR_NPU_DEVICE_IDS=0,1,2,3,4,5,6,7 \
 MODEL_PATH=/models/Qwen3-Coder-30B-A3B-Instruct \
-bash examples/triton_agent/run_train_gpu.sh
+bash run_train_gpu.sh
 ```
 
 `run_train_gpu.sh` changes only the training/rollout backend to NVIDIA
 Megatron/vLLM. It deliberately omits the legacy fork's custom Megatron memory,
 Gateway, KV-routing, checkpoint, debug, and Claude shim changes. Put cluster
-specific NCCL, NIC, CUDA allocator, and vLLM environment variables in
-`RUNTIME_ENV`.
+specific NCCL, NIC, CUDA allocator, and vLLM environment variables in an
+optional `RUNTIME_ENV` file when Ray must propagate them to every worker.
 
 Pin a verl-0.9-supported model, CANN, torch/torch-npu, Triton Ascend, vLLM,
 vLLM-Ascend, Claude Code, and sandbox image digest. This recipe makes no claim

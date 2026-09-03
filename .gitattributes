@@ -1,0 +1,4 @@
+*.sh text eol=lf
+examples/triton_agent/sandbox/tools/*.py text eol=lf
+examples/triton_agent/sandbox/tools/verifier/*.py text eol=lf
+examples/triton_agent/sandbox/Dockerfile text eol=lf

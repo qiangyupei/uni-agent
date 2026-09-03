@@ -259,7 +259,7 @@ class TritonOperatorTask(Task):
         if cfg.template_dir:
             template = shlex.quote(cfg.template_dir)
             commands.insert(0, f"test -d {template}")
-            commands.append(f"cp -a {template}/. {workspace}/")
+            commands.append(f"cp -a --no-preserve=ownership,mode {template}/. {workspace}/")
         result = await sandbox.exec_shell(" && ".join(commands), timeout=cfg.setup_timeout)
         _require_success(result, "workspace setup")
         # Stock ClaudeCodeAgent intentionally uses the sandbox provider's

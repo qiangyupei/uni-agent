@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-set -xeuo pipefail
+set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="${REPO_ROOT:-$(cd "${SCRIPT_DIR}/../.." && pwd)}"
@@ -18,7 +18,8 @@ CKPTS_DIR=${CKPTS_DIR:-"${RAY_DATA_HOME}/ckpts/${project_name}/${exp_name}"}
 AGENT_LOG_DIR=${AGENT_LOG_DIR:-"${RAY_DATA_HOME}/logs/${project_name}/${exp_name}"}
 TRAIN_FILE=${TRAIN_FILE:-"${RAY_DATA_HOME}/data/triton_agent/train.parquet"}
 VAL_FILE=${VAL_FILE:-"${RAY_DATA_HOME}/data/triton_agent/validation.parquet"}
-RUNTIME_ENV=${RUNTIME_ENV:-"${RAY_DATA_HOME}/data/uni_agent/runtime_env.yaml"}
+RUNTIME_ENV=${RUNTIME_ENV:-}
+WORKING_DIR=${WORKING_DIR:-"${REPO_ROOT}"}
 RAY_BIN=${RAY_BIN:-ray}
 TASK_CONFIG=${TASK_CONFIG:-"${RECIPE_DIR}/task_config_kernel_bench.yaml"}
 TOOL_PARSER=${TOOL_PARSER:-qwen3_coder}
@@ -31,54 +32,12 @@ ROLLOUT_MODE=${ROLLOUT_MODE:-async}
 # Each session gets a container on one remote Docker host. Verifier commands,
 # rather than containers, acquire that host's shared NPU file locks.
 REMOTE_DOCKER_HOSTS=${REMOTE_DOCKER_HOSTS:?set comma-separated Docker endpoints, preferably ssh://user@host}
-if [[ "${REMOTE_DOCKER_HOSTS}" == ,* || "${REMOTE_DOCKER_HOSTS}" == *, ||
-  "${REMOTE_DOCKER_HOSTS}" == *,,* ]]; then
-  echo "REMOTE_DOCKER_HOSTS cannot contain empty entries" >&2
-  exit 2
-fi
 IFS=',' read -r -a remote_docker_hosts <<<"${REMOTE_DOCKER_HOSTS}"
-
 EVALUATOR_NPU_DEVICE_IDS=${EVALUATOR_NPU_DEVICE_IDS:?set comma-separated evaluator NPU IDs}
 EVALUATOR_NPU_LOCK_DIR=${EVALUATOR_NPU_LOCK_DIR:-/var/lock/triton-agent-npu}
 EVALUATOR_NPU_LOCK_TIMEOUT=${EVALUATOR_NPU_LOCK_TIMEOUT:-1200}
-if [[ "${EVALUATOR_NPU_DEVICE_IDS}" == ,* || "${EVALUATOR_NPU_DEVICE_IDS}" == *, ||
-  "${EVALUATOR_NPU_DEVICE_IDS}" == *,,* ]]; then
-  echo "EVALUATOR_NPU_DEVICE_IDS cannot contain empty entries" >&2
-  exit 2
-fi
 IFS=',' read -r -a evaluator_devices <<<"${EVALUATOR_NPU_DEVICE_IDS}"
-declare -A seen_evaluator_devices=()
-for evaluator_device in "${evaluator_devices[@]}"; do
-  if [[ ! "${evaluator_device}" =~ ^[A-Za-z0-9_-]+$ ]]; then
-    echo "EVALUATOR_NPU_DEVICE_IDS contains an unsafe device ID: ${evaluator_device}" >&2
-    exit 2
-  fi
-  if [[ -n "${seen_evaluator_devices[${evaluator_device}]:-}" ]]; then
-    echo "EVALUATOR_NPU_DEVICE_IDS cannot contain duplicates: ${evaluator_device}" >&2
-    exit 2
-  fi
-  seen_evaluator_devices["${evaluator_device}"]=1
-done
-EVALUATOR_NPU_COUNT=${EVALUATOR_NPU_COUNT:-${#evaluator_devices[@]}}
-MAX_CONCURRENT_SESSIONS=${MAX_CONCURRENT_SESSIONS:-$((EVALUATOR_NPU_COUNT * ${#remote_docker_hosts[@]}))}
-if [[ ! "${EVALUATOR_NPU_COUNT}" =~ ^[1-9][0-9]*$ ]]; then
-  echo "EVALUATOR_NPU_COUNT must be a positive integer" >&2
-  exit 2
-fi
-if [[ ! "${MAX_CONCURRENT_SESSIONS}" =~ ^[1-9][0-9]*$ ]]; then
-  echo "MAX_CONCURRENT_SESSIONS must be a positive integer (zero means unbounded in Uni-Agent)" >&2
-  exit 2
-fi
-lock_timeout_mantissa=${EVALUATOR_NPU_LOCK_TIMEOUT%%[eE]*}
-if [[ ! "${EVALUATOR_NPU_LOCK_TIMEOUT}" =~ ^\+?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))([eE][+-]?[0-9]+)?$ ||
-  ! "${lock_timeout_mantissa}" =~ [1-9] ]]; then
-  echo "EVALUATOR_NPU_LOCK_TIMEOUT must be a finite positive number" >&2
-  exit 2
-fi
-if (( EVALUATOR_NPU_COUNT != ${#evaluator_devices[@]} )); then
-  echo "EVALUATOR_NPU_COUNT must match EVALUATOR_NPU_DEVICE_IDS" >&2
-  exit 2
-fi
+MAX_CONCURRENT_SESSIONS=${MAX_CONCURRENT_SESSIONS:-$((${#evaluator_devices[@]} * ${#remote_docker_hosts[@]}))}
 # Algorithm parameters.
 adv_estimator=${ADV_ESTIMATOR:-grpo}
 use_kl_in_reward=${USE_KL_IN_REWARD:-False}
@@ -114,35 +73,7 @@ expert_size=${EXPERT_SIZE:-8}
 gen_tp=${GEN_TP:-4}
 infer_dp=${INFER_DP:-1}
 infer_ep=${INFER_EP:-1}
-for topology_value in NNODES NGPUS_PER_NODE usp_size expert_size gen_tp infer_dp infer_ep; do
-  if (( ${!topology_value} < 1 )); then
-    echo "${topology_value} must be positive" >&2
-    exit 2
-  fi
-done
 world_size=$((NNODES * NGPUS_PER_NODE))
-if (( world_size % usp_size != 0 )); then
-  echo "world size must be divisible by USP_SIZE for VeOmni" >&2
-  exit 2
-fi
-veomni_dp_size=$((world_size / usp_size))
-if (( veomni_dp_size % expert_size != 0 )); then
-  echo "VeOmni data-parallel size must be divisible by EXPERT_SIZE" >&2
-  exit 2
-fi
-infer_world_size=$((gen_tp * infer_dp))
-if (( world_size % infer_world_size != 0 )); then
-  echo "world size must be divisible by GEN_TP * INFER_DP" >&2
-  exit 2
-fi
-if (( NGPUS_PER_NODE % gen_tp != 0 )); then
-  echo "NGPUS_PER_NODE must be divisible by GEN_TP for async vLLM" >&2
-  exit 2
-fi
-if (( infer_ep > 1 && infer_ep != infer_world_size )); then
-  echo "INFER_EP > 1 must equal GEN_TP * INFER_DP in verl v0.9" >&2
-  exit 2
-fi
 actor_ppo_max_token_len=$(((total_len + usp_size - 1) / usp_size))
 infer_ppo_max_token_len=$(((total_len + usp_size - 1) / usp_size))
 
@@ -162,8 +93,12 @@ rollout_rs_threshold=${ROLLOUT_RS_THRESHOLD:-"0.999_1.001"}
 router_replay_mode=${ROUTER_REPLAY_MODE:-disabled}
 gpu_memory_utilization=${ROLLOUT_GPU_MEM_UTIL:-0.75}
 
-"${RAY_BIN}" job submit --no-wait --runtime-env "${RUNTIME_ENV}" \
-  -- env RAY_OVERRIDE_JOB_RUNTIME_ENV=1 \
+RUNTIME_ENV_ARGS=()
+if [[ -n "${RUNTIME_ENV}" ]]; then
+  RUNTIME_ENV_ARGS=(--runtime-env "${RUNTIME_ENV}")
+fi
+
+MAIN_CMD=(
   python3 -m verl.trainer.main_ppo \
   trainer.use_v1=True \
   trainer.v1.trainer_mode=colocate_async \
@@ -290,3 +225,7 @@ gpu_memory_utilization=${ROLLOUT_GPU_MEM_UTIL:-0.75}
   trainer.n_gpus_per_node=${NGPUS_PER_NODE} \
   trainer.test_freq=${test_freq} \
   "$@"
+)
+
+"${RAY_BIN}" job submit --no-wait --working-dir="${WORKING_DIR}" "${RUNTIME_ENV_ARGS[@]}" \
+  -- env RAY_OVERRIDE_JOB_RUNTIME_ENV=1 "${MAIN_CMD[@]}"

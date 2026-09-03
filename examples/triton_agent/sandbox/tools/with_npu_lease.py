@@ -23,6 +23,7 @@ from pathlib import Path
 _DEVICES_ENV = "TRITON_EVAL_DEVICE_IDS"
 _LOCK_DIR_ENV = "TRITON_EVAL_LOCK_DIR"
 _TIMEOUT_ENV = "TRITON_EVAL_LOCK_TIMEOUT"
+_STATE_DIR = ".triton_verify_processes"
 
 
 def _devices() -> tuple[str, ...]:
@@ -109,6 +110,17 @@ def _terminate_process_group(pgid: int, grace: float = 5.0) -> None:
                 raise
 
 
+def _write_process_state(child_pid: int | None) -> Path:
+    directory = Path.cwd() / _STATE_DIR
+    directory.mkdir(exist_ok=True)
+    path = directory / f"{os.getpid()}.state"
+    temporary = path.with_suffix(".tmp")
+    kind, child = ("none", 0) if child_pid is None else ("pgid", child_pid)
+    temporary.write_text(f"{os.getpid()} {kind} {child}\n", encoding="utf-8")
+    os.replace(temporary, path)
+    return path
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--check", action="store_true", help="validate the image/mount contract without locking")
@@ -122,46 +134,56 @@ def main() -> int:
     command = args.command[1:] if args.command[:1] == ["--"] else args.command
     if not command:
         parser.error("expected -- COMMAND [ARG ...]")
-    device, handle = _acquire(files, _timeout())
+    state_path = _write_process_state(None)
     try:
-        env = os.environ.copy()
-        env.update(
-            {
-                "ASCEND_RT_VISIBLE_DEVICES": device,
-                "ASCEND_VISIBLE_DEVICES": device,
-                "NPU_VISIBLE_DEVICES": device,
-                "TRITON_EVAL_LEASED_DEVICE": device,
-            }
-        )
-        # Keep the lock FD inherited by the verifier. If the wrapper is
-        # uncatchably killed, the lease remains held until the verifier and its
-        # descendants exit instead of being released into a live NPU process.
-        os.set_inheritable(handle.fileno(), True)
-        child = subprocess.Popen(
-            command,
-            env=env,
-            start_new_session=True,
-            pass_fds=(handle.fileno(),),
-        )
-
-        def forward(signum, _frame):
-            if child.poll() is None:
-                os.killpg(child.pid, signum)
-
-        previous = {signum: signal.signal(signum, forward) for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)}
+        device, handle = _acquire(files, _timeout())
         try:
-            return child.wait()
+            env = os.environ.copy()
+            env.update(
+                {
+                    "ASCEND_RT_VISIBLE_DEVICES": device,
+                    "ASCEND_VISIBLE_DEVICES": device,
+                    "NPU_VISIBLE_DEVICES": device,
+                    "TRITON_EVAL_LEASED_DEVICE": device,
+                }
+            )
+            # Keep the lock FD inherited by the verifier. If the wrapper is
+            # uncatchably killed, the lease remains held until the verifier and
+            # its descendants exit instead of being released into live NPU work.
+            os.set_inheritable(handle.fileno(), True)
+            child = subprocess.Popen(
+                command,
+                env=env,
+                start_new_session=True,
+                pass_fds=(handle.fileno(),),
+            )
+            _write_process_state(child.pid)
+
+            def forward(signum, _frame):
+                if child.poll() is None:
+                    os.killpg(child.pid, signum)
+
+            previous = {
+                signum: signal.signal(signum, forward) for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
+            }
+            try:
+                return child.wait()
+            finally:
+                for signum, handler in previous.items():
+                    signal.signal(signum, handler)
+                _terminate_process_group(child.pid)
+                if child.poll() is None:
+                    child.wait()
         finally:
-            for signum, handler in previous.items():
-                signal.signal(signum, handler)
-            _terminate_process_group(child.pid)
-            if child.poll() is None:
-                child.wait()
+            # Do not issue LOCK_UN: descendants inherit this open-file
+            # description and keep the lease until their final FD is closed.
+            handle.close()
     finally:
-        # Do not issue LOCK_UN: descendants inherit this open-file description.
-        # Closing our copy releases a quiescent group normally, while a leaked
-        # unkillable descendant keeps the lease until the kernel closes its FD.
-        handle.close()
+        state_path.unlink(missing_ok=True)
+        try:
+            state_path.parent.rmdir()
+        except OSError:
+            pass
 
 
 if __name__ == "__main__":

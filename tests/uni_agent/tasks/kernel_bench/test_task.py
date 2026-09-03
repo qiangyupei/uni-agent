@@ -218,6 +218,22 @@ def test_task_config_uses_only_agent_time_verifier() -> None:
     assert all("final_verify" not in path for path in config.trusted_tool_paths)
 
 
+def test_workspace_template_copy_drops_image_ownership_and_mode() -> None:
+    sandbox = FakeSandbox()
+    config = _config().model_copy(
+        update={
+            "template_dir": "/opt/triton-agent-template",
+            "enforce_trusted_image": False,
+            "npu_lease_required": False,
+            "install_transcript_hooks": False,
+        }
+    )
+
+    asyncio.run(TritonOperatorTask(config)._prepare_workspace(sandbox, config, config.metadata, "smoke"))
+
+    assert any("cp -a --no-preserve=ownership,mode" in command for command in sandbox.shell_calls)
+
+
 def test_matching_best_pair_has_priority_and_preserves_train_best() -> None:
     sandbox = FakeSandbox(has_impl=False)
     digest = hashlib.sha256(_BEST_IMPL).hexdigest()
