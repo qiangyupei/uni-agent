@@ -5,5 +5,5 @@
   "sha256": "REPLACE_WITH_SHA256_OF_REVIEWED_SOURCE_TREE",
   "license": "REPLACE_AFTER_MAINTAINER_REVIEW",
   "license_url": "https://example.invalid/LICENSE",
-  "notes": "Download explicitly, verify this digest, review redistribution terms, then point prepare_data.py at disjoint train and validation directories."
+  "notes": "Download explicitly, verify this digest, review redistribution terms, then run uni_agent.tasks.kernel_bench.preprocess on disjoint train and validation directories."
 }

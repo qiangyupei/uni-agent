@@ -57,7 +57,7 @@ def test_sample_binding_preserves_image_run_args() -> None:
         lock_timeout=30,
     )
 
-    config_path = Path(__file__).parents[1] / "config" / "task_config.yaml"
+    config_path = Path(__file__).parents[1] / "task_config_kernel_bench.yaml"
     resolved = TaskConfigResolver.from_file(str(config_path)).resolve(tools["task"])
     sandbox = RemoteDockerSandbox.from_config(SandboxConfig.model_validate(resolved["sandbox"]))
 

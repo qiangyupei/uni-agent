@@ -1,4 +1,4 @@
-"""Deterministic reward calculation for verifier-produced Triton metrics."""
+"""Deterministic KernelBench reward calculation for verifier-produced metrics."""
 
 from __future__ import annotations
 

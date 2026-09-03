@@ -1,4 +1,4 @@
-"""Prepare deterministic, leakage-free Triton operator datasets.
+"""Prepare deterministic, leakage-free KernelBench datasets.
 
 This script intentionally consumes already-reviewed local source trees. Dataset
 download, provenance, checksum, and licence metadata live in a separate manifest

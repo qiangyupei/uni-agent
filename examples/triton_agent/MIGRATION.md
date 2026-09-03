@@ -2,7 +2,7 @@
 
 ## Pinned baselines
 
-- Uni-Agent: `3cbaecc4dc5175fbde61e6cb5d4336a75a7035e4` (latest reviewed main on 2026-08-24).
+- Uni-Agent: `28174fdab3787d307ae3a96d32d3737b600575a0` (recipe and patch baseline).
 - verl submodule: `483b8a009ba3a97563edee3a19887e4862b8094a`, tag `v0.9.0`.
 - Legacy source fork: Uni-Agent
   `691f85d9c968c50fed3587467feb87db3e894d16` with verl
@@ -15,7 +15,7 @@ torch-npu, Triton Ascend, vLLM, vLLM-Ascend, or Claude Code version changes.
 
 | Area | Decision | New implementation |
 | --- | --- | --- |
-| NPU operator data/task/reward | Included | Example-local deterministic preparer, Task, legacy agent-time metric selection, partial-credit reward |
+| NPU operator data/task/reward | Included | `uni_agent.tasks.kernel_bench` preprocessing, Task, legacy agent-time metric selection, and partial-credit reward |
 | NPUKernelBench and DrKernel | Included | JSON/JSONL sidecars, official parquet adapter, multi-case generation, known-invalid validation exclusions |
 | Trajectory crop/filter/best selection | Included | Pure `process_trajectories(trajectories, **policy)` with explicit policy arguments |
 | Per-session sandbox lifecycle | Included | Official `Task.build_sandbox()` async context plus recipe-local remote `DockerSandbox`; a retry creates a fresh container |
@@ -39,9 +39,10 @@ treat it as an implementation blocker.
 
 ## Core patches
 
-The core tree is intentionally unchanged. The first two patches in the
-repository-level `patches/` directory are required for the intended recipe
-semantics:
+The framework, Gateway, Sandbox, and Agent implementations remain unchanged by
+the recipe itself. It adds `uni_agent.tasks.kernel_bench` and its lazy Task
+registry entry. The first two patches in the repository-level `patches/`
+directory are required for the intended recipe semantics:
 
 1. framework-level `trajectory_postprocessor_fqn` plus directly forwarded
    `trajectory_postprocessor_kwargs`; and
@@ -54,8 +55,11 @@ execution still works, but reward delivery is best-effort and cancellation
 cleanup retains the stock boundary.
 
 These are narrow reusable APIs. They are kept as separate PR candidates. The
-current `Task` and `Sandbox` APIs already provide context-managed per-attempt
-creation/destruction and provider-specific kwargs; the lifecycle patch closes
+KernelBench implementation follows the main repository layout under
+`uni_agent/tasks/kernel_bench`; recipe-only configuration and orchestration stay
+under `examples/triton_agent`. The current `Task` and `Sandbox` APIs already
+provide context-managed per-attempt creation/destruction and provider-specific
+kwargs; the lifecycle patch closes
 the generic cancellation/timeout/error-propagation gap without adding a
 recipe-only pool. Remote-Docker selection and evaluator-device contracts remain
 example-local. The provider uses the configured runtime timeout as the
