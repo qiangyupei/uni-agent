@@ -5,7 +5,7 @@
 - name: triton_operator
   sandbox:
     provider: triton_remote_docker
-    image: REPLACE_WITH_PINNED_TRITON_AGENT_NPU_IMAGE_DIGEST
+    image: triton-claude-code-env:new
     runtime_timeout: 15000
     sandbox_kwargs:
       # docker_host and the host-local NPU lock mount are injected per session.

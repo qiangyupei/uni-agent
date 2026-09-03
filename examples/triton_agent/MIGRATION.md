@@ -28,14 +28,12 @@ torch-npu, Triton Ascend, vLLM, vLLM-Ascend, or Claude Code version changes.
 | Custom debug services/UI | Excluded | Existing Uni-Agent logging and dumps only |
 | NPU-memory custom commits | Not migrated by request | See the audit note below |
 
-The legacy workspace's `task-extractor`, `designer`, `npu-arch`, and
-`op-coding` CANNBot skills were not invoked by the retained execution path and
-are not copied. NPUKernelBench's roughly 39 MiB `_all_case.json` was likewise
-unused by its loader and is intentionally omitted. The numerical verifier,
-latency backend, and `verify_once.sh` best-snapshot flow remain pinned sandbox
-image assets; their CANN Open Software License 2.0 headers and notices must be
-retained. This development migration records the licence boundary but does not
-treat it as an implementation blocker.
+The unused `task-extractor` skill and NPUKernelBench's roughly 39 MiB
+`_all_case.json` files are omitted. The skills used by Claude, numerical
+verifier, latency backend, and `verify_once.sh` flow are staged under
+`examples/triton_agent/sandbox` for local image construction. Their existing
+headers and notices must be retained. This development migration records the
+licence boundary but does not treat it as an implementation blocker.
 
 ## Core patches
 
@@ -137,14 +135,14 @@ tests or from the official script skeleton.
 
 - Benchmark archives are not vendored. Their immutable checksum, source URL,
   revision, and licence approval are required before publishing generated data.
-- The legacy CANN verifier declares CANN Open Software License 2.0 obligations,
-  including repository-level licence/notice handling, while Uni-Agent's root is
-  Apache-2.0. NPUKernelBench and DrKernel redistribution terms also need owner
-  confirmation. No such payload is copied until maintainers/legal approve the
-  resulting LICENSE/NOTICE layout.
+- The staged legacy CANN verifier declares CANN Open Software License 2.0
+  obligations, including repository-level licence/notice handling, while
+  Uni-Agent's root is Apache-2.0. NPUKernelBench and DrKernel redistribution
+  terms also need owner confirmation. Do not publish the staged sandbox assets
+  until maintainers/legal approve the resulting LICENSE/NOTICE layout.
 - The sandbox image and evaluator scripts are deployment artifacts. Publish a
-  digest and their licences separately; the shipped placeholder intentionally
-  fails until it is replaced with that immutable reviewed digest.
+  digest and their licences separately. The local `latest` default is for
+  bring-up only and should be replaced with that immutable reviewed digest.
 - By explicit migration decision, after Claude exits the Task does not
   independently rerun correctness or latency. It first reads a substantive best
   implementation paired with `metrics_best.json`; if absent it recovers a pair from the last
@@ -173,9 +171,10 @@ tests or from the official script skeleton.
   remote Docker host. The default deployment uses direct LAN routing and no
   reverse tunnel; Docker endpoint authentication and Gateway routing must be
   integration-tested in the deployment network.
-- Runner-side environment such as `SANDBOX_STOP_TIMEOUT` must be declared in
-  Ray `runtime_env.env_vars`; entrypoint-only shell variables are not a worker
-  propagation mechanism.
+- The launcher supplies the checkout with `ray job submit --working-dir`, so no
+  runtime-env file is required by default. Optional runner-side overrides such
+  as `SANDBOX_STOP_TIMEOUT` belong in Ray `runtime_env.env_vars`; entrypoint-only
+  shell variables are not a worker propagation mechanism.
 - The stock `/sessions/{id}/reward_info` route has no runner-only capability.
   Strict final POST makes delivery failure fatal but cannot authenticate that
   route. Training is blocked until the sandbox can reach only its

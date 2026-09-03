@@ -32,7 +32,7 @@ open(sys.argv[1], "w", encoding="utf-8").write(str(child.pid))
 """,
         encoding="utf-8",
     )
-    wrapper = Path(__file__).parents[1] / "assets" / "with_npu_lease.py"
+    wrapper = Path(__file__).parents[1] / "sandbox" / "tools" / "with_npu_lease.py"
     env = {
         **os.environ,
         "TRITON_EVAL_DEVICE_IDS": "0",
