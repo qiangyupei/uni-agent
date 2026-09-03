@@ -265,33 +265,13 @@ mapping before enabling it.
 
 ## Data preparation
 
-Large benchmark payloads and files with unresolved redistribution terms are not
-vendored. Create an immutable source manifest from
-`config/data_source.example.json`, download and review the archive, and obtain
-maintainer/licence approval. Its `sha256` must be the preparer's deterministic
-digest of the exact extracted train/validation inputs (the manifest file itself,
-`__pycache__`, and `.pyc` files are excluded); a placeholder or mismatch is a
-hard error. Record and verify any original archive digest separately. Then
-prepare genuinely disjoint directories. NPUKernelBench JSON and multi-line
-JSONL sidecars are preserved;
-the verifier-visible filename is canonicalized. Levels 1 and 2 match the old
-default. The latest old training recipe selected all operation families except
-three known resource-heavy operators, so those exclusions are explicit:
+Benchmark payloads are not vendored. For an NPUKernelBench-style source tree,
+prepare disjoint train and validation directories and run:
 
 ```bash
 python -m uni_agent.tasks.kernel_bench.preprocess \
   --train-source /data/reviewed/train \
   --validation-source /data/reviewed/validation \
-  --dataset-name reviewed-npu-benchmark \
-  --dataset-revision <immutable-revision> \
-  --dataset-kind npukernelbench \
-  --npukernelbench-levels 1,2 \
-  --filter-profile none \
-  --exclude-op MoeInitRouting \
-  --exclude-op SwiGLUQuant \
-  --exclude-op KVRMSNormRopeCache \
-  --arch ascend910b1 \
-  --source-manifest /data/reviewed/source_manifest.json \
   --output-dir /data/triton-agent
 ```
 
@@ -302,19 +282,14 @@ For the official DrKernel parquet layout (`training_*.parquet` plus
 python -m uni_agent.tasks.kernel_bench.preprocess \
   --train-source /data/drkernel \
   --validation-source /data/drkernel \
-  --dataset-name drkernel \
-  --dataset-revision <immutable-revision> \
   --dataset-kind drkernel \
-  --drkernel-num-cases 10 \
   --drkernel-validation-levels 1,2 \
-  --filter-profile none \
-  --exclude-op MoeInitRouting \
-  --exclude-op SwiGLUQuant \
-  --exclude-op KVRMSNormRopeCache \
-  --arch ascend910b1 \
-  --source-manifest /data/drkernel/source_manifest.json \
   --output-dir /data/triton-agent
 ```
+
+Both commands write `train.parquet`, `validation.parquet`, and
+`dataset_summary.json`. The defaults are architecture `ascend910b1`, dataset
+revision `local`, ten DrKernel input groups, and NPUKernelBench levels 1 and 2.
 
 The DrKernel adapter generates deterministic `get_input_groups`, varying a safe
 dynamic batch dimension when static analysis permits and otherwise repeating
@@ -332,20 +307,14 @@ and best-effort static input/output element limits are available. Seeded
 split-leakage check; UIDs are content-derived before ordering and never contain
 row indices.
 
-The preparer derives UIDs from dataset identity, immutable revision, source ID,
-recipe schema, architecture, and the final rewritten task/prompt semantics
-rather than shuffle order. It rejects overlapping IDs and renamed duplicate
-content. `dataset_summary.json` records the verified source/manifest digest and
-both generated output digests. To calculate a manifest value before a run:
+The preparer derives stable UIDs, rejects train/validation overlap, and records
+the generated output digests in `dataset_summary.json`. For an audited run,
+`--dataset-name`, `--dataset-revision`, and `--source-manifest` may be supplied;
+the optional manifest format is shown in `config/data_source.example.json`.
+Calculate its source digest with:
 
 ```bash
 python -c "from pathlib import Path; from uni_agent.tasks.kernel_bench.preprocess import source_tree_sha256; print(source_tree_sha256([Path('/data/reviewed/train'), Path('/data/reviewed/validation')]))"
-```
-
-A two-row synthetic fixture validates the schema only:
-
-```bash
-bash examples/triton_agent/prepare_synthetic.sh
 ```
 
 ## Training
