@@ -184,8 +184,8 @@ class TritonOperatorTask(Task):
                     finished = False
                 agent_ms = _elapsed_ms(agent_started)
 
-                # Stop Claude and any agent-time verifier children before reading
-                # their snapshots. This also releases any evaluator NPU lease.
+                # Stop agent-time verifier children before reading their snapshots.
+                # This also releases any evaluator NPU lease.
                 await self._cleanup_task_processes(sandbox, cfg, workspace, required=True)
                 early_stop = await _read_early_stop(sandbox, workspace)
                 evaluate_started = time.monotonic()

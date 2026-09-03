@@ -332,10 +332,7 @@ for device in 0 1 2 3 4 5 6 7; do
 done
 
 cd /path/to/uni-agent/examples/triton_agent/sandbox
-docker tag triton-claude-code-env:latest triton-claude-code-env:base
-BASE_IMAGE=triton-claude-code-env:base \
-OUTPUT_IMAGE=triton-claude-code-env:latest \
-bash build_image.sh
+OUTPUT_IMAGE=triton-claude-code-env:new bash build_image.sh
 ```
 
 For a remote daemon, set `DOCKER_HOST=ssh://sandbox-user@npu-host-01` for the
