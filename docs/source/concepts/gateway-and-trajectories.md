@@ -180,13 +180,14 @@ The result fields have separate contracts:
 - `reward` is the Runner's scalar outcome reward. A streaming Worker receives it as scorer input and decides the final score.
 - `accuracy` becomes the Runner-provided `acc` validation metric.
 - `finished` is a tri-state episode fact, not a validation metric.
-- `extra_info` may contain structured scorer input. A streaming Worker receives it as `extra_info["runner_reward_info"]["reward_context"]`; it is never aggregated directly as a validation metric.
+- `extra_info` may contain compact task metadata and structured scorer input. JSON-serializable, non-reserved fields up to 64 KiB become Runner metrics and are visible to trajectory postprocessors. A streaming Worker also receives the original mapping as `extra_info["runner_reward_info"]["reward_context"]`.
 
 The names at the two boundaries are intentional: `Trajectory.reward_metrics` is
 the Framework's internal field, while VERL's Worker response calls the same
 output channel `reward_extra_info` when it is serialized under
-`extra_fields["reward_extra_info"]`. `TaskResult.extra_info` is a separate
-Runner-to-scorer context channel and is not copied into either metrics field.
+`extra_fields["reward_extra_info"]`. `TaskResult.extra_info` is copied into
+Runner metrics only after reserved-key, serialization, and size checks; its
+original mapping remains a separate Runner-to-scorer context channel.
 
 Runner and Worker metrics are not merged in streaming mode. The Worker's
 `reward_extra_info` is the complete final metric/metadata set returned by the

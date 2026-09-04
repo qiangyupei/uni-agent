@@ -39,6 +39,26 @@ logger = logging.getLogger(__name__)
 
 
 TrajectoryPostprocessor = Callable[..., list[Trajectory] | Awaitable[list[Trajectory]]]
+_MAX_TASK_RESULT_EXTRA_INFO_BYTES = 64 * 1024
+_TASK_RESULT_RESERVED_KEYS = frozenset({"reward", "acc", "finished"})
+
+
+def _reward_metrics_from_task_result(result: TaskResult) -> dict[str, object]:
+    metrics = {} if result.accuracy is None else {"acc": result.accuracy}
+    conflicts = sorted(_TASK_RESULT_RESERVED_KEYS.intersection(result.extra_info))
+    if conflicts:
+        logger.warning("ignoring reserved TaskResult.extra_info keys: %s", ", ".join(conflicts))
+    extra_info = {key: value for key, value in result.extra_info.items() if key not in _TASK_RESULT_RESERVED_KEYS}
+    try:
+        serialized = json.dumps(extra_info, allow_nan=False)
+    except (TypeError, ValueError, OverflowError, RecursionError) as exc:
+        logger.warning("omitting TaskResult.extra_info from reward metrics: %s", exc)
+        return metrics
+    if len(serialized.encode("utf-8")) > _MAX_TASK_RESULT_EXTRA_INFO_BYTES:
+        logger.warning("omitting TaskResult.extra_info from reward metrics: serialized metadata exceeds 64 KiB")
+        return metrics
+    metrics.update(extra_info)
+    return metrics
 
 
 @dataclass
@@ -278,7 +298,7 @@ def _trajectory_to_reward_dataproto(trajectory, sample_fields, task_result: Task
                 **dict(sample_fields.get("extra_info") or {}),
                 "runner_reward_info": {
                     "reward": task_result.reward,
-                    "metrics": {} if task_result.accuracy is None else {"acc": task_result.accuracy},
+                    "metrics": _reward_metrics_from_task_result(task_result),
                     "reward_context": dict(task_result.extra_info),
                 },
             }
@@ -857,14 +877,14 @@ class GatewayAgentFramework(AgentFramework):
             # they filter or reorder trajectories.  These fields are the
             # Framework-owned trajectory representation of the session result;
             # scorer metadata remains a separate Worker output channel.
+            task_metrics = _reward_metrics_from_task_result(task_result)
             if session_trajectories:
-                runner_metrics = {} if task_result.accuracy is None else {"acc": task_result.accuracy}
                 session_trajectories = [
                     replace(
                         trajectory,
                         finished=task_result.finished,
                         reward_score=task_result.reward,
-                        reward_metrics=dict(runner_metrics),
+                        reward_metrics=dict(task_metrics),
                     )
                     for trajectory in session_trajectories
                 ]
@@ -897,7 +917,6 @@ class GatewayAgentFramework(AgentFramework):
                 annotations = None
                 reward_source = None
 
-            task_metrics = {} if task_result.accuracy is None else {"acc": task_result.accuracy}
             if annotations is None:
                 logger.info("session %s: Framework produced no reward; rm_scores remain zero", session_id)
                 result_trajectories = [

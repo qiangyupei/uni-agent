@@ -10,7 +10,12 @@ import pytest
 import torch
 
 from tests.uni_agent.support import logging_runner
-from uni_agent.framework.framework import GatewayAgentFramework, _align_routed_experts
+from uni_agent.framework.framework import (
+    _MAX_TASK_RESULT_EXTRA_INFO_BYTES,
+    GatewayAgentFramework,
+    _align_routed_experts,
+    _reward_metrics_from_task_result,
+)
 from uni_agent.gateway.session import SessionHandle, Trajectory
 from uni_agent.tasks import TaskResult
 from verl.utils import tensordict_utils as tu
@@ -628,7 +633,12 @@ async def test_postprocessor_sees_runner_annotations_before_scoring():
     _POSTPROCESSOR_CALLS.clear()
 
     async def result_runner(**kwargs):
-        return TaskResult(reward=0.75, accuracy=0.5, finished=False)
+        return TaskResult(
+            reward=0.75,
+            accuracy=0.5,
+            finished=False,
+            extra_info={"reward": 99, "acc": 0, "finished": True, "train_best": 3},
+        )
 
     framework = await _build_framework_with_agent_runners(
         agent_runners={"runner": _inline_runner_config(result_runner)},
@@ -648,8 +658,19 @@ async def test_postprocessor_sees_runner_annotations_before_scoring():
 
     processed = _POSTPROCESSOR_CALLS[0]
     assert [(trajectory.reward_score, trajectory.reward_metrics, trajectory.finished) for trajectory in processed] == [
-        (0.75, {"acc": 0.5}, False)
+        (0.75, {"acc": 0.5, "train_best": 3}, False)
     ]
+
+
+@pytest.mark.cpu
+@pytest.mark.level0
+@pytest.mark.parametrize(
+    "extra_info",
+    [{"invalid": object()}, {"not_finite": float("nan")}, {"text": "x" * _MAX_TASK_RESULT_EXTRA_INFO_BYTES}],
+)
+def test_invalid_task_result_extra_info_is_omitted_from_reward_metrics(extra_info):
+    result = TaskResult(accuracy=0.5, extra_info=extra_info)
+    assert _reward_metrics_from_task_result(result) == {"acc": 0.5}
 
 
 @pytest.mark.cpu
@@ -700,7 +721,7 @@ async def test_reward_worker_processes_runner_reward_info_and_owns_final_metrics
             "index": 3,
             "runner_reward_info": {
                 "reward": 0.5,
-                "metrics": {"acc": 1.0},
+                "metrics": {"acc": 1.0, "case_id": "case-1"},
                 "reward_context": {"case_id": "case-1"},
             },
         }
@@ -1725,8 +1746,8 @@ async def test_score_trajectories_dispatches_only_final_trajectory():
     """Reward scoring dispatches only the final trajectory to the worker and
     broadcasts that score and extra info to every trajectory in the session.
 
-    Explicit reward context is merged into the worker input without becoming
-    validation output on its own.
+    Bounded TaskResult metadata is exposed as Runner metrics and remains
+    available to custom scorers as reward context.
     """
 
     class _ComputeScoreRemote:
@@ -1793,7 +1814,7 @@ async def test_score_trajectories_dispatches_only_final_trajectory():
             "case_id": "case-1",
             "runner_reward_info": {
                 "reward": 0.9,
-                "metrics": {"acc": 1.0},
+                "metrics": {"acc": 1.0, "index": "from-reward-context"},
                 "reward_context": {"index": "from-reward-context"},
             },
         }
