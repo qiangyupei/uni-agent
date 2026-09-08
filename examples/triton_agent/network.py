@@ -25,7 +25,7 @@ def _copy_sandbox_kwargs(tools_kwargs: dict[str, Any]) -> tuple[dict[str, Any], 
 def parse_device_ids(value: str) -> tuple[str, ...]:
     raw_devices = tuple(part.strip() for part in value.split(","))
     if not raw_devices or any(not part for part in raw_devices):
-        raise ValueError("evaluator_npu_device_ids cannot contain empty entries")
+        raise ValueError(f"evaluator_npu_device_ids cannot contain empty entries; received {value!r}")
     devices = raw_devices
     if len(set(devices)) != len(devices):
         raise ValueError("evaluator_npu_device_ids cannot contain duplicates")

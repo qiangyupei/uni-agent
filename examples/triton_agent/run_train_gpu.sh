@@ -10,17 +10,18 @@ cd "${REPO_ROOT}"
 # Keep NCCL/NIC/CUDA settings in the Ray runtime environment so every worker
 # receives the same values.
 RECIPE_DIR="examples/triton_agent"
-NNODES=${NNODES:-2}
+NNODES=${NNODES:-1}
 NGPUS_PER_NODE=${NGPUS_PER_NODE:-${N_GPUS:-8}}
 
 project_name=${PROJECT_NAME:-"Uni-Agent-Triton-Agent-megatron-gpu-sync"}
 exp_name=${EXP_NAME:-"$(date +%Y%m%d%H%M)_exp"}
-RAY_DATA_HOME=${RAY_DATA_HOME:-"${HOME}/verl"}
-MODEL_PATH=${MODEL_PATH:-"${RAY_DATA_HOME}/models/Qwen3-Coder-30B-A3B-Instruct"}
-CKPTS_DIR=${CKPTS_DIR:-"${RAY_DATA_HOME}/ckpts/${project_name}/${exp_name}"}
-AGENT_LOG_DIR=${AGENT_LOG_DIR:-"${RAY_DATA_HOME}/logs/${project_name}/${exp_name}"}
-TRAIN_FILE=${TRAIN_FILE:-"${RAY_DATA_HOME}/data/triton_agent/train.parquet"}
-VAL_FILE=${VAL_FILE:-"${RAY_DATA_HOME}/data/triton_agent/validation.parquet"}
+DATA_HOME=${DATA_HOME:-"${HOME}"}
+MODEL_PATH=${MODEL_PATH:-"${DATA_HOME}/models/Qwen3-Coder-30B-A3B-Instruct"}
+CKPTS_DIR=${CKPTS_DIR:-"${DATA_HOME}/ckpts/${project_name}/${exp_name}"}
+mkdir -p "${CKPTS_DIR}"
+AGENT_LOG_DIR=${AGENT_LOG_DIR:-"${DATA_HOME}/logs/${project_name}/${exp_name}"}
+TRAIN_FILE=${TRAIN_FILE:-"${DATA_HOME}/data/triton-agent/train.parquet"}
+VAL_FILE=${VAL_FILE:-"${DATA_HOME}/data/triton-agent/validation.parquet"}
 RUNTIME_ENV=${RUNTIME_ENV:-}
 WORKING_DIR=${WORKING_DIR:-"${REPO_ROOT}"}
 TASK_CONFIG=${TASK_CONFIG:-"${RECIPE_DIR}/task_config_kernel_bench.yaml"}
@@ -51,10 +52,10 @@ clip_ratio_high=${CLIP_RATIO_HIGH:-0.28}
 loss_agg_mode=${LOSS_AGG_MODE:-seq-mean-token-mean}
 loss_mode=${LOSS_MODE:-vanilla}
 
-max_prompt_length=${MAX_PROMPT_LENGTH:-184320}
+max_prompt_length=${MAX_PROMPT_LENGTH:-131072}
 max_response_length=${MAX_RESPONSE_LENGTH:-8192}
-max_model_len=${MAX_MODEL_LEN:-196608}
-train_total_length_limit=${TRAIN_TOTAL_LENGTH_LIMIT:-184320}
+max_model_len=${MAX_MODEL_LEN:-139264}
+train_total_length_limit=${TRAIN_TOTAL_LENGTH_LIMIT:-131072}
 total_len=$((max_prompt_length + max_response_length))
 if (( total_len > max_model_len )); then
   echo "MAX_PROMPT_LENGTH + MAX_RESPONSE_LENGTH must not exceed MAX_MODEL_LEN" >&2
@@ -83,13 +84,13 @@ megatron_optimizer_offload=${MEGATRON_OPTIMIZER_OFFLOAD:-False}
 optimizer_offload_fraction=${OFFLOAD_FRACTION:-1.0}
 use_precision_aware_optimizer=${USE_PRECISION_AWARE_OPTIMIZER:-False}
 use_mbridge=${USE_MBRIDGE:-True}
-actor_use_dist_ckpt=${ACTOR_USE_DIST_CKPT:-True}
+actor_use_dist_ckpt=${ACTOR_USE_DIST_CKPT:-False}
 ref_use_dist_ckpt=${REF_USE_DIST_CKPT:-False}
 gen_tp=${GEN_TP:-8}
-train_tp=${TP:-2}
+train_tp=${TP:-4}
 train_pp=${PP:-1}
-train_cp=${CP:-8}
-train_ep=${EP:-8}
+train_cp=${CP:-2}
+train_ep=${EP:-1}
 train_etp=${ETP:-1}
 actor_ppo_max_token_len=${PPO_MAX_TOKEN_LEN_PER_GPU:-32768}
 infer_ppo_max_token_len=${LOG_PROB_MAX_TOKEN_LEN_PER_GPU:-${actor_ppo_max_token_len}}
@@ -231,8 +232,8 @@ MAIN_CMD=(
   ++actor_rollout_ref.rollout.custom.agent_framework.agent_runners.task.runner_kwargs.model_name=${SERVED_MODEL_NAME} \
   ++actor_rollout_ref.rollout.custom.agent_framework.agent_runners.task.runner_kwargs.report_reward=True \
   ++actor_rollout_ref.rollout.custom.agent_framework.agent_runners.task.runner_kwargs.reward_post_strict=True \
-  "++actor_rollout_ref.rollout.custom.agent_framework.agent_runners.task.runner_kwargs.remote_docker_hosts='${REMOTE_DOCKER_HOSTS}'" \
-  "++actor_rollout_ref.rollout.custom.agent_framework.agent_runners.task.runner_kwargs.evaluator_npu_device_ids='${EVALUATOR_NPU_DEVICE_IDS}'" \
+  ++actor_rollout_ref.rollout.custom.agent_framework.agent_runners.task.runner_kwargs.remote_docker_hosts='${REMOTE_DOCKER_HOSTS}' \
+  ++actor_rollout_ref.rollout.custom.agent_framework.agent_runners.task.runner_kwargs.evaluator_npu_device_ids='${EVALUATOR_NPU_DEVICE_IDS}' \
   ++actor_rollout_ref.rollout.custom.agent_framework.agent_runners.task.runner_kwargs.evaluator_npu_lock_dir=${EVALUATOR_NPU_LOCK_DIR} \
   ++actor_rollout_ref.rollout.custom.agent_framework.agent_runners.task.runner_kwargs.evaluator_npu_lock_timeout=${EVALUATOR_NPU_LOCK_TIMEOUT} \
   actor_rollout_ref.rollout.gpu_memory_utilization=${gpu_memory_utilization} \
@@ -294,5 +295,5 @@ MAIN_CMD=(
   "$@"
 )
 
-ray job submit --no-wait --working-dir="${WORKING_DIR}" "${RUNTIME_ENV_ARGS[@]}" \
-  -- env RAY_OVERRIDE_JOB_RUNTIME_ENV=1 "${MAIN_CMD[@]}"
+ray job submit --working-dir="${WORKING_DIR}" "${RUNTIME_ENV_ARGS[@]}" \
+  -- env RAY_OVERRIDE_JOB_RUNTIME_ENV=1 "${MAIN_CMD[@]}" 2>&1 | tee -i "log.log"
