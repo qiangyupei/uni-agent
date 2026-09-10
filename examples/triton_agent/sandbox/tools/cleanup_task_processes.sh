@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 set -uo pipefail
 
+if (( EUID != 0 )); then
+  exec /usr/bin/sudo -n -H /opt/triton-agent-tools/cleanup_task_processes.sh
+fi
+
 state_dir="${PWD}/.triton_verify_processes"
 shopt -s nullglob
 

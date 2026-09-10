@@ -23,13 +23,14 @@ Check the resulting image before rollout:
 
 ```bash
 docker run --rm --entrypoint bash triton-claude-code-env:new -lc \
-  'test "$(id -u)" != 0 && test -x /opt/triton-agent-tools/verify_once.sh && test -d /opt/triton-agent-template'
+  'test "$(id -u)" != 0 && sudo -n -l /opt/triton-agent-tools/verify_once.sh >/dev/null && test -d /opt/triton-agent-template'
 ```
 
 The base image must already contain Claude Code, Python, `timeout`, the Ascend
 runtime, torch/torch-npu, Triton Ascend, the verifier's Python dependencies, and
-the non-root `claude` user. The derived layer only copies recipe files and sets
-their links and permissions. Set `SANDBOX_USER` when the existing user has a
+the non-root `claude` user and `sudo`. The derived layer only copies recipe files,
+sets their links and permissions, and allows that user to run the fixed verifier
+and cleanup entry points as root. Set `SANDBOX_USER` when the existing user has a
 different name; the layer does not install packages or create users.
 
 Because the task uses `pull_policy: never`, build the same image on every

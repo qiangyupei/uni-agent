@@ -2,6 +2,18 @@
 set -uo pipefail
 
 TOOLS_DIR=/opt/triton-agent-tools
+if (( EUID != 0 )); then
+  exec /usr/bin/sudo -n -H "${TOOLS_DIR}/verify_once.sh" "$@"
+fi
+
+# Match the root login environment used by the previous Ascend sandbox.
+if [[ -r /etc/profile ]]; then
+  set +u
+  # shellcheck disable=SC1091
+  source /etc/profile
+  set -u
+fi
+
 VERIFIER_DIR="${TOOLS_DIR}/verifier"
 WORKSPACE="$(pwd -P)"
 OP_NAME=${1:-${OPERATOR_NAME:-}}
@@ -87,4 +99,3 @@ fi
   --perf-result "${perf_result}"
 
 exit "${verify_status}"
-

@@ -151,11 +151,12 @@ attempt runs `pwd` without a
 workdir override and fails before Claude starts unless it equals
 `workspace_dir`; this is required because the stock `ClaudeCodeAgent` correctly
 uses the sandbox process cwd rather than a recipe-specific launch path.
-Claude must run as a non-root user. Before rollout, the task rejects root and
-checks that every trusted tool is a non-symlink regular executable owned by
-root, not group/other writable, beneath a root-owned non-writable directory
-chain. A dedicated worker is not a reason to run the agent as root: root could
-replace the verifier and invalidate reward trust.
+Claude runs as a non-root user. Before rollout, the task rejects root and checks
+that every trusted tool is a non-symlink regular executable owned by root, not
+group/other writable, beneath a root-owned non-writable directory chain. The
+image gives Claude passwordless sudo only for the fixed verifier and process
+cleanup entry points; both immediately re-exec as root because the qualified
+Ascend runtime does not initialize for the image's non-root user.
 
 The template contains:
 
@@ -180,6 +181,12 @@ agent workspace:
 - `/opt/triton-agent-tools/with_npu_lease.py`, built from the reviewed recipe
   asset, installed root-owned/non-writable, and invoked by `verify_once.sh`
   before any NPU work.
+
+The base image must provide `sudo`. Unlike the previous deployment's
+`NOPASSWD:SETENV: ALL`, the generated sudoers rule names only
+`verify_once.sh` and `cleanup_task_processes.sh`. Cleanup uses the same elevation
+so it can terminate a root verifier and release its inherited NPU lock after an
+agent timeout or cancellation.
 
 The shipped Docker `run_args` mirror the old Ascend deployment's privileged
 device and driver mounts. Adjust host paths to the qualified cluster image and
@@ -219,14 +226,12 @@ recomputes
 AST/compile/correctness/speedup components from the selected raw metrics, and a
 full pass is represented by pass rate one rather than a separate bonus.
 
-This is deliberately the legacy trust model. The implementation, verifier JSON,
-`metrics.json`, and `metrics_best.json` all remain writable by the agent. A
-matching digest, timestamp, or best pair detects accidental mismatch but cannot
-authenticate case counts or latency because the agent can rewrite both sides.
-There is no runner-owned trust proof, and the Task does not invoke the evaluator
-after Claude exits. Use this recipe only where that tradeoff is accepted;
-restoring trusted reward would require a runner/provider-owned verifier boundary
-rather than treating these checks as one.
+This retains the legacy execution model: the privileged root verifier imports
+agent-authored implementation code, and the Task does not invoke an independent
+evaluator after Claude exits. A matching digest, timestamp, or best pair detects
+accidental mismatch but is not a runner-owned trust proof. Use this recipe only
+where that tradeoff is accepted; a stronger boundary requires a separate
+runner/provider-owned evaluator service.
 
 The task installs project-local Claude Code `PreToolUse`, `PostToolUse`, and
 `PostToolUseFailure` hooks for Bash. Only commands containing
