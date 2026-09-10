@@ -6,13 +6,17 @@ if (( EUID != 0 )); then
   exec /usr/bin/sudo -n -H "${TOOLS_DIR}/verify_once.sh" "$@"
 fi
 
-# Match the root login environment used by the previous Ascend sandbox.
-if [[ -r /etc/profile ]]; then
-  set +u
-  # shellcheck disable=SC1091
-  source /etc/profile
-  set -u
+# sudo removes linker variables such as LD_LIBRARY_PATH. Rebuild the CANN
+# runtime environment before importing torch_npu.
+CANN_ENV=/usr/local/Ascend/cann/set_env.sh
+if [[ ! -r "${CANN_ENV}" ]]; then
+  echo "[verify-once] missing CANN environment: ${CANN_ENV}" >&2
+  exit 2
 fi
+set +u
+# shellcheck disable=SC1091
+source "${CANN_ENV}"
+set -u
 
 VERIFIER_DIR="${TOOLS_DIR}/verifier"
 WORKSPACE="$(pwd -P)"

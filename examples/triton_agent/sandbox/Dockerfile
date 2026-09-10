@@ -1,5 +1,3 @@
-# syntax=docker/dockerfile:1.7
-
 ARG BASE_IMAGE=triton-claude-code-env:latest
 FROM ${BASE_IMAGE}
 
