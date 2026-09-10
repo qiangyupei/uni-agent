@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import types
+from copy import deepcopy
 from dataclasses import replace
 
 import numpy as np
@@ -21,34 +22,39 @@ _POSTPROCESSOR_CALLS = []
 _NOT_CALLABLE_POSTPROCESSOR = 42
 
 
-def _recording_trajectory_postprocessor(trajectories, *, policy=None):
+def _recording_trajectory_postprocessor(trajectories, *, task_result, policy=None):
     _POSTPROCESSOR_CALLS.append((trajectories, policy))
     return list(reversed(trajectories))
 
 
-async def _async_trajectory_postprocessor(trajectories):
+async def _async_trajectory_postprocessor(trajectories, *, task_result):
+    assert task_result == TaskResult()
     await asyncio.sleep(0)
     return list(trajectories[-1:])
 
 
-def _recording_reward_postprocessor(trajectories):
-    _POSTPROCESSOR_CALLS.append(tuple(trajectories))
+def _mutating_task_result_postprocessor(trajectories, *, task_result):
+    _POSTPROCESSOR_CALLS.append((trajectories, task_result))
+    task_result.reward = -1.0
+    task_result.accuracy = -1.0
+    task_result.finished = not task_result.finished
+    task_result.extra_info["nested"]["values"].append(-1)
     return list(trajectories)
 
 
-def _empty_trajectory_postprocessor(_trajectories):
+def _empty_trajectory_postprocessor(_trajectories, *, task_result):
     return []
 
 
-def _tuple_trajectory_postprocessor(trajectories):
+def _tuple_trajectory_postprocessor(trajectories, *, task_result):
     return tuple(trajectories)
 
 
-def _invalid_item_trajectory_postprocessor(trajectories):
+def _invalid_item_trajectory_postprocessor(trajectories, *, task_result):
     return ["not-a-trajectory"]
 
 
-def _dropping_finalized_field_postprocessor(trajectories, *, field):
+def _dropping_finalized_field_postprocessor(trajectories, *, task_result, field):
     replacement = {} if field == "reward_metrics" else None
     return [replace(trajectories[-1], **{field: replacement})]
 
@@ -624,32 +630,39 @@ async def test_runner_reward_is_used_without_custom_scorer_even_when_worker_exis
 @pytest.mark.cpu
 @pytest.mark.level0
 @pytest.mark.asyncio
-async def test_postprocessor_sees_runner_annotations_before_scoring():
+@pytest.mark.parametrize("reward", [0.75, None], ids=["runner-reward", "no-reward"])
+async def test_postprocessor_task_result_is_isolated_from_runner_and_tq(reward, fake_tq):
     _POSTPROCESSOR_CALLS.clear()
+    task_result = TaskResult(
+        reward=reward,
+        accuracy=0.5,
+        finished=False,
+        extra_info={"nested": {"values": [1]}, "tags": {"test"}},
+    )
+    original = deepcopy(task_result)
 
     async def result_runner(**kwargs):
-        return TaskResult(reward=0.75, accuracy=0.5, finished=False)
+        return task_result
 
     framework = await _build_framework_with_agent_runners(
         agent_runners={"runner": _inline_runner_config(result_runner)},
         gateway_manager=_FakeGatewayManager({"session-sample-0-rollout-0": [_trajectory()]}),
-        trajectory_postprocessor_fqn=f"{__name__}._recording_reward_postprocessor",
+        trajectory_postprocessor_fqn=f"{__name__}._mutating_task_result_postprocessor",
     )
 
-    await framework._run_agent_episode(
-        sample_fields={"raw_prompt": [], "uid": "uid-0"},
-        sample_index=0,
-        session_index=0,
-        global_steps=7,
-        runner_name="runner",
-        runner_config=framework.runner_registry["runner"],
-        sampling_params={},
-    )
+    await framework.generate_sequences(_build_prompts(count=1, global_steps=7))
 
-    processed = _POSTPROCESSOR_CALLS[0]
-    assert [(trajectory.reward_score, trajectory.reward_metrics, trajectory.finished) for trajectory in processed] == [
-        (0.75, {"acc": 0.5}, False)
+    processed, copied_result = _POSTPROCESSOR_CALLS[0]
+    assert copied_result is not task_result
+    assert copied_result.extra_info["nested"]["values"] == [1, -1]
+    assert copied_result.extra_info["tags"] == original.extra_info["tags"]
+    assert task_result == original
+    assert [(traj.reward_score, traj.reward_metrics, traj.finished) for traj in processed] == [
+        (reward, {"acc": 0.5}, False)
     ]
+    fields = fake_tq.batch_puts[0]["fields"]
+    assert tu.get(fields, "extra_fields")[0]["reward_extra_info"] == {"acc": 0.5}
+    assert fields["rm_scores"][0].sum().item() == (reward or 0.0)
 
 
 @pytest.mark.cpu
@@ -673,7 +686,7 @@ async def test_reward_worker_processes_runner_reward_info_and_owns_final_metrics
             reward=0.5,
             accuracy=1.0,
             finished=True,
-            extra_info={"case_id": "case-1"},
+            extra_info={"case_id": "case-1", "nested": {"values": [1]}},
         )
 
     worker = _Worker()
@@ -683,6 +696,7 @@ async def test_reward_worker_processes_runner_reward_info_and_owns_final_metrics
         gateway_manager=runtime,
         reward_loop_worker_handles=[worker],
         reward_config={"custom_reward_function": {"path": "pkg://custom_reward.py"}},
+        trajectory_postprocessor_fqn=f"{__name__}._mutating_task_result_postprocessor",
     )
 
     trajectories, _ = await framework._run_agent_episode(
@@ -701,7 +715,7 @@ async def test_reward_worker_processes_runner_reward_info_and_owns_final_metrics
             "runner_reward_info": {
                 "reward": 0.5,
                 "metrics": {"acc": 1.0},
-                "reward_context": {"case_id": "case-1"},
+                "reward_context": {"case_id": "case-1", "nested": {"values": [1]}},
             },
         }
     ]
@@ -1536,7 +1550,7 @@ async def test_trajectory_postprocessor_reports_invalid_extensions(
     )
 
     with pytest.raises(error_type, match=error_message):
-        await framework._apply_trajectory_postprocessor([_trajectory()])
+        await framework._apply_trajectory_postprocessor([_trajectory()], TaskResult())
 
 
 @pytest.mark.cpu
@@ -1553,7 +1567,7 @@ async def test_trajectory_postprocessor_rejects_dropped_finalized_fields(field):
 
     with pytest.raises(ValueError, match="must preserve finalized reward fields"):
         await framework._apply_trajectory_postprocessor(
-            [_trajectory(reward_score=0.5, reward_metrics={"acc": 1.0}, finished=False)]
+            [_trajectory(reward_score=0.5, reward_metrics={"acc": 1.0}, finished=False)], TaskResult()
         )
 
 

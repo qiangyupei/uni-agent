@@ -430,6 +430,7 @@ class GatewayAgentFramework(AgentFramework):
     async def _apply_trajectory_postprocessor(
         self,
         trajectories: list[Trajectory],
+        task_result: TaskResult,
     ) -> list[Trajectory]:
         """Apply the optional sync/async postprocessor and validate its result."""
         expected_reward_fields = (
@@ -441,7 +442,9 @@ class GatewayAgentFramework(AgentFramework):
             if trajectories
             else (None, None, {})
         )
-        result = self._trajectory_postprocessor(tuple(trajectories), **self._trajectory_postprocessor_kwargs)
+        result = self._trajectory_postprocessor(
+            tuple(trajectories), task_result=deepcopy(task_result), **self._trajectory_postprocessor_kwargs
+        )
         if inspect.isawaitable(result):
             result = await result
 
@@ -857,20 +860,20 @@ class GatewayAgentFramework(AgentFramework):
             # they filter or reorder trajectories.  These fields are the
             # Framework-owned trajectory representation of the session result;
             # scorer metadata remains a separate Worker output channel.
+            task_metrics = {} if task_result.accuracy is None else {"acc": task_result.accuracy}
             if session_trajectories:
-                runner_metrics = {} if task_result.accuracy is None else {"acc": task_result.accuracy}
                 session_trajectories = [
                     replace(
                         trajectory,
                         finished=task_result.finished,
                         reward_score=task_result.reward,
-                        reward_metrics=dict(runner_metrics),
+                        reward_metrics=dict(task_metrics),
                     )
                     for trajectory in session_trajectories
                 ]
 
             if self._trajectory_postprocessor is not None:
-                session_trajectories = await self._apply_trajectory_postprocessor(session_trajectories)
+                session_trajectories = await self._apply_trajectory_postprocessor(session_trajectories, task_result)
 
             if not session_trajectories:
                 session_trace.finish(
@@ -897,17 +900,9 @@ class GatewayAgentFramework(AgentFramework):
                 annotations = None
                 reward_source = None
 
-            task_metrics = {} if task_result.accuracy is None else {"acc": task_result.accuracy}
             if annotations is None:
                 logger.info("session %s: Framework produced no reward; rm_scores remain zero", session_id)
-                result_trajectories = [
-                    replace(
-                        traj,
-                        finished=task_result.finished,
-                        reward_metrics=dict(task_metrics),
-                    )
-                    for traj in session_trajectories
-                ]
+                result_trajectories = session_trajectories
             else:
                 logger.info("session %s: scored via %s", session_id, reward_source)
                 result_trajectories = [
