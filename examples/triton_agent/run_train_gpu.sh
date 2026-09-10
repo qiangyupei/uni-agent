@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+export DOCKER_API_VERSION=1.43
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="${REPO_ROOT:-$(cd "${SCRIPT_DIR}/../.." && pwd)}"
 cd "${REPO_ROOT}"
@@ -13,10 +15,10 @@ RECIPE_DIR="examples/triton_agent"
 NNODES=${NNODES:-1}
 NGPUS_PER_NODE=${NGPUS_PER_NODE:-${N_GPUS:-8}}
 
-project_name=${PROJECT_NAME:-"Uni-Agent-Triton-Agent-megatron-gpu-sync"}
+project_name=${PROJECT_NAME:-"Triton-Agent-sync"}
 exp_name=${EXP_NAME:-"$(date +%Y%m%d%H%M)_exp"}
 DATA_HOME=${DATA_HOME:-"${HOME}"}
-MODEL_PATH=${MODEL_PATH:-"${DATA_HOME}/models/Qwen3-Coder-30B-A3B-Instruct"}
+MODEL_PATH=${MODEL_PATH:-"${DATA_HOME}/models/Qwen3.6-35B-A3B"}
 CKPTS_DIR=${CKPTS_DIR:-"${DATA_HOME}/ckpts/${project_name}/${exp_name}"}
 mkdir -p "${CKPTS_DIR}"
 AGENT_LOG_DIR=${AGENT_LOG_DIR:-"${DATA_HOME}/logs/${project_name}/${exp_name}"}
@@ -35,12 +37,14 @@ ROLLOUT_MODE=${ROLLOUT_MODE:-async}
 # Training/rollout uses NVIDIA GPUs. Operator verification runs in per-session
 # containers on the remote Ascend hosts below.
 REMOTE_DOCKER_HOSTS=${REMOTE_DOCKER_HOSTS:?set comma-separated Docker endpoints, preferably ssh://user@host}
+REMOTE_DOCKER_HOSTS_PARSER="${REMOTE_DOCKER_HOSTS//,/\\\\,}"
 IFS=',' read -r -a remote_docker_hosts <<<"${REMOTE_DOCKER_HOSTS}"
 EVALUATOR_NPU_DEVICE_IDS=${EVALUATOR_NPU_DEVICE_IDS:?set comma-separated evaluator NPU IDs}
+EVALUATOR_NPU_DEVICE_IDS_PARSER="${EVALUATOR_NPU_DEVICE_IDS//,/\\\\,}"
 EVALUATOR_NPU_LOCK_DIR=${EVALUATOR_NPU_LOCK_DIR:-/var/lock/triton-agent-npu}
 EVALUATOR_NPU_LOCK_TIMEOUT=${EVALUATOR_NPU_LOCK_TIMEOUT:-1200}
 IFS=',' read -r -a evaluator_devices <<<"${EVALUATOR_NPU_DEVICE_IDS}"
-MAX_CONCURRENT_SESSIONS=${MAX_CONCURRENT_SESSIONS:-$((${#evaluator_devices[@]} * ${#remote_docker_hosts[@]}))}
+MAX_CONCURRENT_SESSIONS=${MAX_CONCURRENT_SESSIONS:-$((${#evaluator_devices[@]} * ${#remote_docker_hosts[@]} * 4))}
 # Algorithm and sequence lengths.
 adv_estimator=${ADV_ESTIMATOR:-grpo}
 use_kl_in_reward=${USE_KL_IN_REWARD:-False}
@@ -49,7 +53,7 @@ use_kl_loss=${USE_KL_LOSS:-False}
 kl_loss_coef=${KL_LOSS_COEF:-0.002}
 clip_ratio_low=${CLIP_RATIO_LOW:-0.2}
 clip_ratio_high=${CLIP_RATIO_HIGH:-0.28}
-loss_agg_mode=${LOSS_AGG_MODE:-seq-mean-token-mean}
+loss_agg_mode=${LOSS_AGG_MODE:-token-mean}
 loss_mode=${LOSS_MODE:-vanilla}
 
 max_prompt_length=${MAX_PROMPT_LENGTH:-131072}
@@ -87,19 +91,19 @@ use_mbridge=${USE_MBRIDGE:-True}
 actor_use_dist_ckpt=${ACTOR_USE_DIST_CKPT:-False}
 ref_use_dist_ckpt=${REF_USE_DIST_CKPT:-False}
 gen_tp=${GEN_TP:-8}
-train_tp=${TP:-4}
+train_tp=${TP:-2}
 train_pp=${PP:-1}
-train_cp=${CP:-2}
-train_ep=${EP:-1}
+train_cp=${CP:-4}
+train_ep=${EP:-8}
 train_etp=${ETP:-1}
 actor_ppo_max_token_len=${PPO_MAX_TOKEN_LEN_PER_GPU:-32768}
 infer_ppo_max_token_len=${LOG_PROB_MAX_TOKEN_LEN_PER_GPU:-${actor_ppo_max_token_len}}
 
-train_prompt_bsz=${BATCH_SIZE:-12}
+train_prompt_bsz=${BATCH_SIZE:-8}
 val_prompt_bsz=${VAL_BATCH_SIZE:-128}
-n_resp_per_prompt=${ROLLOUT_N:-14}
+n_resp_per_prompt=${ROLLOUT_N:-8}
 val_resp_per_prompt=${VAL_ROLLOUT_N:-1}
-train_prompt_mini_bsz=${PPO_MINI_BATCH_SIZE:-3}
+train_prompt_mini_bsz=${PPO_MINI_BATCH_SIZE:-2}
 actor_lr=${ACTOR_LR:-1e-6}
 lr_decay_steps=${LR_DECAY_STEPS:-2000}
 test_freq=${TEST_FREQ:-10}
@@ -107,7 +111,7 @@ save_freq=${SAVE_FREQ:-10}
 total_epochs=${TOTAL_EPOCHS:-100}
 val_before_train=${VAL_BEFORE_TRAIN:-False}
 gpu_memory_utilization=${ROLLOUT_GPU_MEM_UTIL:-0.60}
-rollout_max_num_seqs=${ROLLOUT_MAX_NUM_SEQS:-5}
+rollout_max_num_seqs=${ROLLOUT_MAX_NUM_SEQS:-50}
 rollout_max_num_batched_tokens=${ROLLOUT_MAX_NUM_BATCHED_TOKENS:-49152}
 
 # Official rollout-correction defaults.
@@ -147,7 +151,7 @@ MAIN_CMD=(
   algorithm.kl_ctrl.kl_coef=${kl_coef} \
   actor_rollout_ref.model.path="${MODEL_PATH}" \
   +actor_rollout_ref.model.override_config.model_config.max_position_embeddings=${total_len} \
-  actor_rollout_ref.model.use_remove_padding=False \
+  actor_rollout_ref.model.use_remove_padding=True \
   actor_rollout_ref.actor.use_kl_loss=${use_kl_loss} \
   actor_rollout_ref.actor.kl_loss_coef=${kl_loss_coef} \
   actor_rollout_ref.actor.clip_ratio_low=${clip_ratio_low} \
@@ -165,7 +169,7 @@ MAIN_CMD=(
   +actor_rollout_ref.actor.optim.override_optimizer_config.optimizer_cpu_offload=True \
   actor_rollout_ref.actor.megatron.use_mbridge=${use_mbridge} \
   actor_rollout_ref.actor.megatron.use_dist_checkpointing=${actor_use_dist_ckpt} \
-  actor_rollout_ref.actor.megatron.use_remove_padding=False \
+  actor_rollout_ref.actor.megatron.use_remove_padding=True \
   actor_rollout_ref.actor.megatron.pad_bshd_to_minibatch_max=False \
   actor_rollout_ref.actor.megatron.param_offload=${offload} \
   actor_rollout_ref.actor.megatron.grad_offload=${offload} \
@@ -175,7 +179,7 @@ MAIN_CMD=(
   actor_rollout_ref.actor.megatron.context_parallel_size=${train_cp} \
   actor_rollout_ref.actor.megatron.expert_model_parallel_size=${train_ep} \
   actor_rollout_ref.actor.megatron.expert_tensor_parallel_size=${train_etp} \
-  +actor_rollout_ref.actor.megatron.override_transformer_config.apply_rope_fusion=True \
+  +actor_rollout_ref.actor.megatron.override_transformer_config.apply_rope_fusion=False \
   +actor_rollout_ref.actor.megatron.override_transformer_config.masked_softmax_fusion=True \
   +actor_rollout_ref.actor.megatron.override_transformer_config.bias_activation_fusion=True \
   +actor_rollout_ref.actor.megatron.override_transformer_config.bias_dropout_fusion=True \
@@ -232,8 +236,8 @@ MAIN_CMD=(
   ++actor_rollout_ref.rollout.custom.agent_framework.agent_runners.task.runner_kwargs.model_name=${SERVED_MODEL_NAME} \
   ++actor_rollout_ref.rollout.custom.agent_framework.agent_runners.task.runner_kwargs.report_reward=True \
   ++actor_rollout_ref.rollout.custom.agent_framework.agent_runners.task.runner_kwargs.reward_post_strict=True \
-  ++actor_rollout_ref.rollout.custom.agent_framework.agent_runners.task.runner_kwargs.remote_docker_hosts='${REMOTE_DOCKER_HOSTS}' \
-  ++actor_rollout_ref.rollout.custom.agent_framework.agent_runners.task.runner_kwargs.evaluator_npu_device_ids='${EVALUATOR_NPU_DEVICE_IDS}' \
+  "++actor_rollout_ref.rollout.custom.agent_framework.agent_runners.task.runner_kwargs.remote_docker_hosts=${REMOTE_DOCKER_HOSTS_PARSER}" \
+  "++actor_rollout_ref.rollout.custom.agent_framework.agent_runners.task.runner_kwargs.evaluator_npu_device_ids=${EVALUATOR_NPU_DEVICE_IDS_PARSER}" \
   ++actor_rollout_ref.rollout.custom.agent_framework.agent_runners.task.runner_kwargs.evaluator_npu_lock_dir=${EVALUATOR_NPU_LOCK_DIR} \
   ++actor_rollout_ref.rollout.custom.agent_framework.agent_runners.task.runner_kwargs.evaluator_npu_lock_timeout=${EVALUATOR_NPU_LOCK_TIMEOUT} \
   actor_rollout_ref.rollout.gpu_memory_utilization=${gpu_memory_utilization} \
@@ -264,7 +268,7 @@ MAIN_CMD=(
   actor_rollout_ref.ref.log_prob_use_dynamic_bsz=${use_dynamic_bsz} \
   actor_rollout_ref.ref.log_prob_max_token_len_per_gpu=${infer_ppo_max_token_len} \
   actor_rollout_ref.ref.megatron.use_dist_checkpointing=${ref_use_dist_ckpt} \
-  actor_rollout_ref.ref.megatron.use_remove_padding=False \
+  actor_rollout_ref.ref.megatron.use_remove_padding=True \
   actor_rollout_ref.ref.megatron.pad_bshd_to_minibatch_max=False \
   actor_rollout_ref.ref.megatron.param_offload=${offload} \
   actor_rollout_ref.ref.megatron.tensor_model_parallel_size=${train_tp} \
@@ -284,16 +288,16 @@ MAIN_CMD=(
   trainer.experiment_name="${exp_name}" \
   trainer.val_before_train=${val_before_train} \
   trainer.device=cuda \
-  trainer.save_freq=${save_freq} \
   trainer.total_epochs=${total_epochs} \
   trainer.resume_mode=auto \
   trainer.log_val_generations=10 \
   trainer.default_local_dir="${CKPTS_DIR}" \
   trainer.nnodes=${NNODES} \
   trainer.n_gpus_per_node=${NGPUS_PER_NODE} \
+  trainer.save_freq=${save_freq} \
   trainer.test_freq=${test_freq} \
   "$@"
 )
 
 ray job submit --working-dir="${WORKING_DIR}" "${RUNTIME_ENV_ARGS[@]}" \
-  -- env RAY_OVERRIDE_JOB_RUNTIME_ENV=1 "${MAIN_CMD[@]}" 2>&1 | tee -i "log.log"
+  -- env RAY_OVERRIDE_JOB_RUNTIME_ENV=1 "${MAIN_CMD[@]}" 2>&1 | tee -i "logs/${project_name}/${exp_name}.log"
