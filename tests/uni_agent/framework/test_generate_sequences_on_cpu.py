@@ -213,17 +213,22 @@ async def test_from_config_warns_for_unsupported_colocated_hybrid_reward(
         "expected_rollback",
         "expected_cache",
         "expected_chat_template_kwargs",
+        "expected_mm_processor_kwargs",
     ),
     [
-        ({}, {}, True, True, {}),
+        ({}, {}, True, True, {}, {}),
         (
-            {"apply_chat_template_kwargs": {"thinking": True}},
+            {
+                "apply_chat_template_kwargs": {"thinking": True},
+                "mm_processor_kwargs": {"max_pixels": 1024},
+            },
             {"enable_last_assistant_rollback": False},
             False,
             True,
             {"thinking": True},
+            {"max_pixels": 1024},
         ),
-        ({}, {"enable_tool_parser_cache": False}, True, False, {}),
+        ({}, {"enable_tool_parser_cache": False}, True, False, {}, {}),
     ],
 )
 def test_build_gateway_manager_wires_gateway_config_defaults(
@@ -233,6 +238,7 @@ def test_build_gateway_manager_wires_gateway_config_defaults(
     expected_rollback,
     expected_cache,
     expected_chat_template_kwargs,
+    expected_mm_processor_kwargs,
 ):
     from omegaconf import OmegaConf
 
@@ -241,6 +247,13 @@ def test_build_gateway_manager_wires_gateway_config_defaults(
     class _ModelConfig:
         tokenizer = object()
         processor = None
+        hf_config = types.SimpleNamespace(model_type="deepseek_v4")
+
+    class _RolloutConfig:
+        name = "vllm"
+        prompt_length = 128
+        response_length = 64
+        multi_turn = types.SimpleNamespace(format="hermes")
 
     captured = {}
 
@@ -250,7 +263,11 @@ def test_build_gateway_manager_wires_gateway_config_defaults(
             captured["gateway_count"] = gateway_count
             captured["gateway_actor_config"] = gateway_actor_config
 
-    monkeypatch.setattr(entry_module, "omega_conf_to_dataclass", lambda _config: _ModelConfig())
+    monkeypatch.setattr(
+        entry_module,
+        "omega_conf_to_dataclass",
+        lambda cfg: _RolloutConfig() if "multi_turn" in cfg else _ModelConfig(),
+    )
     monkeypatch.setattr(entry_module, "GatewayManager", _FakeGatewayManager)
 
     llm_client = object()
@@ -286,8 +303,10 @@ def test_build_gateway_manager_wires_gateway_config_defaults(
     assert captured["gateway_actor_config"].rollout_backend == "vllm"
     assert captured["gateway_actor_config"].enable_last_assistant_rollback is expected_rollback
     assert captured["gateway_actor_config"].enable_tool_parser_cache is expected_cache
+    assert captured["gateway_actor_config"].hf_model_type == "deepseek_v4"
     assert isinstance(captured["gateway_actor_config"].apply_chat_template_kwargs, dict)
     assert captured["gateway_actor_config"].apply_chat_template_kwargs == expected_chat_template_kwargs
+    assert captured["gateway_actor_config"].mm_processor_kwargs == expected_mm_processor_kwargs
 
 
 class _FakeTransferQueue:
