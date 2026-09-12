@@ -172,7 +172,6 @@ MAIN_CMD=(
   actor_rollout_ref.actor.megatron.use_remove_padding=True \
   actor_rollout_ref.actor.megatron.pad_bshd_to_minibatch_max=False \
   actor_rollout_ref.actor.megatron.param_offload=${offload} \
-  actor_rollout_ref.actor.megatron.grad_offload=${offload} \
   actor_rollout_ref.actor.megatron.optimizer_offload=${megatron_optimizer_offload} \
   actor_rollout_ref.actor.megatron.tensor_model_parallel_size=${train_tp} \
   actor_rollout_ref.actor.megatron.pipeline_model_parallel_size=${train_pp} \
