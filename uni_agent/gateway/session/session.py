@@ -420,7 +420,6 @@ class GatewaySession:
         incoming_message_prefix_hashes = self._extend_message_prefix_hashes([], messages)
         selection = self._select_chain(
             tools=tools,
-            messages=messages,
             incoming_message_prefix_hashes=incoming_message_prefix_hashes,
         )
         rollback_applied = False
@@ -578,7 +577,6 @@ class GatewaySession:
         self,
         *,
         tools: list[dict[str, Any]] | None,
-        messages: list[dict[str, Any]],
         incoming_message_prefix_hashes: list[str],
     ) -> tuple[ChainState, bool] | None:
         ranked_candidates = []
@@ -599,16 +597,10 @@ class GatewaySession:
             if assistant_start_len == len(incoming_message_prefix_hashes):
                 has_fresh_boundary = True
                 continue
-            exact_prefix_match = self._is_chain_prefix_hash_match(
+            if self._is_chain_prefix_hash_match(
                 chain=chain,
                 incoming_message_prefix_hashes=incoming_message_prefix_hashes,
-            )
-            incremental_start = len(chain.message_history) if exact_prefix_match else assistant_start_len
-            # CT permits assistant context, but a non-empty context delta
-            # cannot end with assistant. Such requests need a full prompt.
-            if incremental_start < len(messages) and messages[-1].get("role") == "assistant":
-                continue
-            if exact_prefix_match:
+            ):
                 ranked_candidates.append((chain, len(chain.message_history), True))
                 continue
             if self._enable_last_assistant_rollback:
