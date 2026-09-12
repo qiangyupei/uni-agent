@@ -420,6 +420,7 @@ class GatewaySession:
         incoming_message_prefix_hashes = self._extend_message_prefix_hashes([], messages)
         selection = self._select_chain(
             tools=tools,
+            messages=messages,
             incoming_message_prefix_hashes=incoming_message_prefix_hashes,
         )
         rollback_applied = False
@@ -577,26 +578,37 @@ class GatewaySession:
         self,
         *,
         tools: list[dict[str, Any]] | None,
+        messages: list[dict[str, Any]],
         incoming_message_prefix_hashes: list[str],
     ) -> tuple[ChainState, bool] | None:
         ranked_candidates = []
         deepest_rollback_candidates = []
         deepest_rollback_service_value = -1
+        has_fresh_boundary = False
         for chain in self.active_chains:
             if chain.chain_id in self.reserved_chain_ids or chain.active_tool_schemas != tools:
                 continue
             assistant_start = chain.last_assistant_start
             assistant_start_len = assistant_start.message_history_len
-            # A request ending exactly at the boundary is a fresh sample from
-            # the same prompt, not a rewrite of the abandoned assistant.
-            if assistant_start_len >= len(incoming_message_prefix_hashes):
+            if assistant_start_len > len(incoming_message_prefix_hashes):
                 continue
             if incoming_message_prefix_hashes[assistant_start_len - 1] != assistant_start.tip_hash:
                 continue
-            if self._is_chain_prefix_hash_match(
+            # The same input boundary requests a fresh sibling, not a rollback
+            # of a shallower chain. Exact-prefix reuse remains valid.
+            if assistant_start_len == len(incoming_message_prefix_hashes):
+                has_fresh_boundary = True
+                continue
+            exact_prefix_match = self._is_chain_prefix_hash_match(
                 chain=chain,
                 incoming_message_prefix_hashes=incoming_message_prefix_hashes,
-            ):
+            )
+            incremental_start = len(chain.message_history) if exact_prefix_match else assistant_start_len
+            # CT permits assistant context, but a non-empty context delta
+            # cannot end with assistant. Such requests need a full prompt.
+            if incremental_start < len(messages) and messages[-1].get("role") == "assistant":
+                continue
+            if exact_prefix_match:
                 ranked_candidates.append((chain, len(chain.message_history), True))
                 continue
             if self._enable_last_assistant_rollback:
@@ -606,6 +618,8 @@ class GatewaySession:
                 elif assistant_start_len == deepest_rollback_service_value:
                     deepest_rollback_candidates.append(chain)
 
+        if has_fresh_boundary:
+            deepest_rollback_candidates.clear()
         if len(deepest_rollback_candidates) == 1:
             rollback_chain = deepest_rollback_candidates[0]
             ranked_candidates.append((rollback_chain, deepest_rollback_service_value, False))
