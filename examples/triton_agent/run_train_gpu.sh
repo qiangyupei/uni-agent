@@ -21,6 +21,8 @@ DATA_HOME=${DATA_HOME:-"${HOME}"}
 MODEL_PATH=${MODEL_PATH:-"${DATA_HOME}/models/Qwen3.6-35B-A3B"}
 CKPTS_DIR=${CKPTS_DIR:-"${DATA_HOME}/ckpts/${project_name}/${exp_name}"}
 mkdir -p "${CKPTS_DIR}"
+LOG_DIR=${LOG_DIR:-"${DATA_HOME}/logs/${project_name}"}
+mkdir -p "${LOG_DIR}"
 AGENT_LOG_DIR=${AGENT_LOG_DIR:-"${DATA_HOME}/logs/${project_name}/${exp_name}"}
 TRAIN_FILE=${TRAIN_FILE:-"${DATA_HOME}/data/triton-agent/train.parquet"}
 VAL_FILE=${VAL_FILE:-"${DATA_HOME}/data/triton-agent/validation.parquet"}
