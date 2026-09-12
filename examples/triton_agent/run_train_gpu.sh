@@ -80,7 +80,7 @@ val_temperature=${VAL_TEMPERATURE:-0.0}
 val_top_p=${VAL_TOP_P:-1.0}
 val_top_k=${VAL_TOP_K:--1}
 
-# Stock verl 0.9 Megatron/vLLM topology, retaining the legacy launcher's
+# Upstream Megatron/vLLM topology, retaining the legacy launcher's
 # synchronous batching and model-parallel defaults.
 use_dynamic_bsz=${USE_DYNAMIC_BSZ:-False}
 offload=${OFFLOAD:-True}
@@ -234,8 +234,6 @@ MAIN_CMD=(
   ++actor_rollout_ref.rollout.custom.agent_framework.agent_runners.task.trajectory_selection=all \
   ++actor_rollout_ref.rollout.custom.agent_framework.agent_runners.task.runner_kwargs.task_config_path=${TASK_CONFIG} \
   ++actor_rollout_ref.rollout.custom.agent_framework.agent_runners.task.runner_kwargs.model_name=${SERVED_MODEL_NAME} \
-  ++actor_rollout_ref.rollout.custom.agent_framework.agent_runners.task.runner_kwargs.report_reward=True \
-  ++actor_rollout_ref.rollout.custom.agent_framework.agent_runners.task.runner_kwargs.reward_post_strict=True \
   "++actor_rollout_ref.rollout.custom.agent_framework.agent_runners.task.runner_kwargs.remote_docker_hosts=${REMOTE_DOCKER_HOSTS_PARSER}" \
   "++actor_rollout_ref.rollout.custom.agent_framework.agent_runners.task.runner_kwargs.evaluator_npu_device_ids=${EVALUATOR_NPU_DEVICE_IDS_PARSER}" \
   ++actor_rollout_ref.rollout.custom.agent_framework.agent_runners.task.runner_kwargs.evaluator_npu_lock_dir=${EVALUATOR_NPU_LOCK_DIR} \

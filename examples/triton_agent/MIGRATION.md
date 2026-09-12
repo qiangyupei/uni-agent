@@ -1,6 +1,23 @@
 # Migration scope and verification ledger
 
-## Pinned baselines
+## Current rebase (2026-09-12)
+
+The recipe now targets Uni-Agent main `10743439` with pinned verl
+`a9f2985159536a607211dcac730d3f5d55028950` and locally includes PR #189.
+PR #144 passes `task_result` into the trajectory hook. Best-prefix/retry hints
+come from `task_result.extra_info`, not `Trajectory.reward_info`; canonical reward
+fields are preserved. Reward POST options are obsolete and removed.
+The audit below records the original migration baseline, not current installation
+instructions. Use README.md for the current workflow. In particular, the old
+reward-endpoint deployment gate and PR1/PR2/PR3 patch stack do not apply.
+
+Rebase validation (Windows/Python 3.13): 211 passed, 1 skipped, 1 Ray deprecation
+warning across recipe, KernelBench, framework/task runner, multi-chain Gateway,
+and CT codec tests. The skipped NPU lease integration requires Linux root.
+Focused Ruff 0.12.2 check/format, both launchers' `bash -n`, and `git diff --check`
+passed. No GPU/NPU end-to-end training or full repository hooks were run.
+
+## Historical pinned baselines
 
 - Uni-Agent: `28174fdab3787d307ae3a96d32d3737b600575a0` (recipe and patch baseline).
 - verl submodule: `483b8a009ba3a97563edee3a19887e4862b8094a`, tag `v0.9.0`.

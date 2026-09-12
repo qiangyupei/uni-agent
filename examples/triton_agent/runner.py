@@ -5,8 +5,8 @@ The adapter has two intentionally small responsibilities:
 * import the example-local remote Docker provider; and
 * bind this session to a remote Docker host and NPU lock namespace.
 
-Task construction, reward reporting, and ``TaskResult.extra_info`` validation
-remain owned by :func:`uni_agent.framework.task_runner.run_task`; the
+Task construction remains owned by the generic runner; its TaskResult is returned
+to the framework for scoring and postprocessing. The
 ``triton_operator`` Task is loaded lazily from
 :mod:`uni_agent.tasks.kernel_bench.task`.
 """
@@ -34,7 +34,6 @@ async def run_triton_task(
     evaluator_npu_device_ids: str,
     evaluator_npu_lock_dir: str = "/var/lock/triton-agent-npu",
     evaluator_npu_lock_timeout: float = 1200.0,
-    reward_post_strict: bool = True,
     **kwargs: Any,
 ):
     """Run one Triton task through Uni-Agent's generic Task runner."""
@@ -66,6 +65,5 @@ async def run_triton_task(
         tools_kwargs=copied,
         raw_prompt=raw_prompt,
         sample_index=sample_index,
-        reward_post_strict=reward_post_strict,
         **kwargs,
     )

@@ -1,6 +1,6 @@
 """Pure trajectory selection/cropping used by the framework hook PR.
 
-The public entry point depends only on finalized ``Trajectory`` values and
+The public entry point depends only on finalized ``Trajectory`` values, ``TaskResult.extra_info``, and
 explicit policy arguments. It does not reach back into the framework, Gateway,
 tokenizer, or environment variables.
 """
@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from uni_agent.gateway.session import Trajectory
+    from uni_agent.tasks import TaskResult
 
 logger = logging.getLogger(__name__)
 
@@ -27,6 +28,7 @@ _STALE_AFTER_CROP = {
 def process_trajectories(
     trajectories: tuple[Trajectory, ...],
     *,
+    task_result: TaskResult,
     selection: str = "all_final",
     best_fallback: str = "all_final",
     best_requires_correctness: bool = False,
@@ -65,15 +67,15 @@ def process_trajectories(
     _choice(alignment_error, "alignment_error", {"raise", "drop"})
     _choice(empty_policy, "empty_policy", {"drop", "keep_last", "raise"})
 
-    reward_info = source[-1].reward_info if isinstance(source[-1].reward_info, dict) else {}
-    if _as_bool(drop_no_impl) and (reward_info.get("no_impl_retry_filter") or reward_info.get("no_impl_retry_failed")):
+    task_info = task_result.extra_info
+    if _as_bool(drop_no_impl) and (task_info.get("no_impl_retry_filter") or task_info.get("no_impl_retry_failed")):
         return _on_empty(source, empty_policy, "no implementation produced")
 
     indexed = list(enumerate(source))
     if (
         _as_bool(discard_pre_retry)
-        and reward_info.get("no_impl_retry_used")
-        and reward_info.get("no_impl_retry_discard_previous")
+        and task_info.get("no_impl_retry_used")
+        and task_info.get("no_impl_retry_discard_previous")
     ):
         indexed = indexed[-1:]
 
@@ -96,7 +98,7 @@ def process_trajectories(
         # supplies only a scalar assistant index and no chain identity, so it is
         # unsafe to consume that hint across more than one trajectory.
         if len(valid) > 1:
-            if isinstance(reward_info.get("train_best"), Mapping):
+            if isinstance(task_info.get("train_best"), Mapping):
                 logger.warning(
                     "ignoring scalar best-assistant hint for %s finalized trajectories; falling back to %s",
                     len(valid),
@@ -106,7 +108,7 @@ def process_trajectories(
         else:
             selected = _select_best(
                 valid,
-                reward_info,
+                task_info,
                 max_total_tokens,
                 requires_correctness=_as_bool(best_requires_correctness),
             )
@@ -186,17 +188,17 @@ def crop_to_assistant_prefix(
 
 def _select_best(
     indexed: list[tuple[int, Trajectory]],
-    reward_info: Mapping[str, Any],
+    task_info: Mapping[str, Any],
     max_total_tokens: int | None,
     *,
     requires_correctness: bool,
 ) -> list[Trajectory] | None:
     if len(indexed) != 1:
         raise ValueError("a scalar best-assistant hint requires exactly one finalized trajectory")
-    metrics = reward_info.get("metrics")
+    metrics = task_info.get("metrics")
     if requires_correctness and isinstance(metrics, Mapping) and not bool(metrics.get("correctness_ok")):
         return None
-    train_best = reward_info.get("train_best")
+    train_best = task_info.get("train_best")
     if not isinstance(train_best, Mapping):
         return None
     best_index = _as_int_or_none(train_best.get("assistant_index"))

@@ -13,7 +13,6 @@ from ..network import bind_remote_sandbox, parse_device_ids
 class SessionHandle:
     session_id: str
     base_url: str | None = None
-    reward_info_url: str | None = None
 
 
 def test_runner_injects_shared_npu_lease_environment() -> None:
@@ -75,18 +74,20 @@ def test_npu_lease_rejects_non_positive_or_non_finite_timeout(timeout: float) ->
         )
 
 
-def test_recipe_runner_requests_fail_closed_reward_post(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_recipe_runner_returns_task_result(monkeypatch: pytest.MonkeyPatch) -> None:
+    from uni_agent.tasks import TaskResult
+
     captured = {}
+    expected = TaskResult(reward=0.5, accuracy=0.25, finished=True, extra_info={"train_best": {"assistant_index": 0}})
 
     async def fake_run_task(**kwargs):
         captured.update(kwargs)
-        return "ok"
+        return expected
 
     monkeypatch.setattr(runner_module, "run_task", fake_run_task)
     session = SessionHandle(
         "session-1",
         base_url="http://gateway/sessions/session-1/v1",
-        reward_info_url="http://gateway/sessions/session-1/reward_info",
     )
     result = asyncio.run(
         runner_module.run_triton_task(
@@ -94,12 +95,10 @@ def test_recipe_runner_requests_fail_closed_reward_post(monkeypatch: pytest.Monk
             tools_kwargs={"task": {"name": "triton_operator", "metadata": {}}},
             remote_docker_hosts="ssh://sandbox-a",
             evaluator_npu_device_ids="0,1",
-            report_reward=True,
         )
     )
 
-    assert result == "ok"
-    assert captured["reward_post_strict"] is True
+    assert result is expected
     assert captured["tools_kwargs"]["task"]["metadata"]["runtime"]["session_id"] == "session-1"
     assert captured["tools_kwargs"]["task"]["sandbox"]["sandbox_kwargs"]["docker_host"] == "ssh://sandbox-a"
     assert captured["tools_kwargs"]["task"]["sandbox"]["sandbox_kwargs"]["npu_lock_dir"] == (

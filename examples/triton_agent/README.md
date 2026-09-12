@@ -2,10 +2,10 @@
 
 This example migrates the NPU operator task and training-trajectory behavior to
 the stock Uni-Agent Task, Sandbox, Gateway, and Claude Code APIs. It targets
-Uni-Agent `28174fdab3787d307ae3a96d32d3737b600575a0` plus the `verl` v0.9.0
-submodule (`483b8a009ba3a97563edee3a19887e4862b8094a`). It intentionally contains no
-custom Gateway, KV-cache router, Megatron, checkpoint, debug, Claude protocol
-shim, or NPU-memory patches.
+Uni-Agent main `10743439` (merged PR #144) and its pinned verl submodule
+`a9f2985159536a607211dcac730d3f5d55028950`, plus the local PR #189 chain-selection
+fix. Use this pinned verl revision, not release v0.9.0: main now depends on CT.
+There are no recipe-specific KV-router, Megatron, checkpoint, debug, or NPU-memory patches.
 
 See `MIGRATION.md` for the exact scope matrix, old/new behavior differences,
 NPU-memory audit, external blockers, and verification ledger.
@@ -38,33 +38,24 @@ examples/triton_agent/
 The package name is `kernel_bench`, while the registered Task and prepared-data
 route remain `triton_operator` for compatibility with existing datasets.
 
-## Core patches
+## Upstream integration
 
-The intended best-prefix and reward-metadata behavior requires the first two
-patches under the repository-level `patches/` directory:
+PR #143 (trajectory hook) and the revised PR #144 are already in this branch's
+main baseline. PR #189 is cherry-picked locally. Do not apply the historical
+PR1/PR2/PR3 mail patches from `patches/` on top of this branch.
 
-1. the framework-level `trajectory_postprocessor_fqn` hook; and
-2. bounded, JSON-serializable `TaskResult.extra_info` reward forwarding.
+The runner returns `TaskResult` directly to the framework. The processor receives
+`process_trajectories(trajectories, *, task_result, **kwargs)` and reads best-prefix
+and retry hints from `task_result.extra_info`. It preserves the framework's
+`Trajectory.finished`, `reward_score`, and `reward_metrics`; it no longer reads
+`Trajectory.reward_info`. The launchers use the task's reward/accuracy directly,
+with no reward POST or extra-info-to-metrics forwarding.
 
-Those two patches are the minimum functional stack for the healthy training
-path. The remaining patches strengthen failure handling but are not required
-for initial bring-up.
-
-For a production run, also stack:
-
-3. opt-in fail-closed reward delivery; and
-4. cancellation-safe, bounded Sandbox lifecycle cleanup.
-
-The hook is configured once in `run_train.sh` at
-`actor_rollout_ref.rollout.custom.agent_framework`. Built-in
-`trajectory_selection` remains `all`, so the pure recipe processor receives
-every materialized chain before scoring and TransferQueue writes.
-The lifecycle patch reads `SANDBOX_STOP_TIMEOUT` in the Ray worker. Set it in
-`RUNTIME_ENV.env_vars` when overriding the patch default. The recipe's remote
-Docker provider also turns `sandbox.runtime_timeout` into a container TTL.
-Without patches 3 and 4, the healthy path still creates, reports, and destroys
-the sandbox, but reward POST failures remain best-effort and cancellation
-cleanup has the stock lifecycle boundary.
+Built-in `trajectory_selection` remains `all`, allowing the recipe to see all
+finalized chains. Scalar best-assistant hints still fall back for multiple chains.
+The remote Docker provider retains its container TTL for hard-killed workers.
+The historical sandbox lifecycle patch is not applied by this rebase and must
+be re-reviewed against main before any optional use.
 
 Benchmark datasets are not vendored. The local image layer under `sandbox/`
 contains the legacy numerical verifier and selected skill material needed by
@@ -103,17 +94,10 @@ This task configuration must use `examples.triton_agent.runner.run_triton_task`,
 which imports and registers the example-local provider before delegating to the
 generic Task runner.
 
-The stock Gateway reward endpoint is not authenticated. With the strict
-reward-delivery patch applied, the example's `reward_post_strict=True` makes a
-failed runner-side reward POST abort the session instead of consuming an earlier
-value. Without that patch, stock `run_task` ignores this optional runner argument
-and reward delivery remains best-effort. Fail-closed delivery is not endpoint
-authentication. Before any real training, give the runner a
-runner-only reward capability or enforce a network proxy/ACL that exposes only
-this session's `/v1/messages` route to the sandbox and denies direct Gateway
-reachability. Direct Docker-host networking does not prove that property.
-Reward-endpoint isolation is a hard deployment gate; this recipe
-does not reintroduce the explicitly excluded Gateway changes.
+Rewards now travel through the managed runner return value, not a sandbox-reachable
+Gateway reward endpoint. The old strict reward POST option is removed from the
+recipe runner and launchers. This does not change the need to isolate the
+privileged evaluator containers and their host devices.
 
 One sandbox is not automatically one NPU. This recipe makes exclusivity
 executable: the runner injects a reviewed device list and lock location, and
@@ -375,7 +359,7 @@ Both launchers locate the repository root from their own path and pass it to
 `ray job submit --working-dir`. This makes the example modules and relative
 `TASK_CONFIG` available to the Ray job without a separate runtime-env file, so
 the scripts may be launched directly from `examples/triton_agent`. The verl
-v0.9.0 environment should already be installed on the Ray image.
+environment matching the pinned verl revision should already be installed on the Ray image.
 
 `RUNTIME_ENV` is optional and is only needed for deployment-specific packages
 or environment variables that must be propagated to Ray workers. Do not put a

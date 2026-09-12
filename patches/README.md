@@ -1,4 +1,16 @@
-# Uni-Agent prerequisite patches
+# Historical Uni-Agent patches
+
+## Current recipe branch
+
+The recipe is rebased onto main `10743439`, including merged PR #143 and revised
+PR #144, and locally cherry-picks PR #189. **Do not apply the PR1/PR2/PR3 mail
+patches below to this branch.** Metadata now reaches the processor through
+`task_result.extra_info`; reward delivery uses the managed TaskResult return,
+not HTTP POST. The old patches remain archived for their original baseline.
+PR4 is not applied and needs a fresh compatibility review before use.
+The application commands and results below refer only to the historical baseline.
+
+## Historical patch stack
 
 These patches stay outside the recipe branch so each change can be reviewed as
 a focused Uni-Agent pull request.
