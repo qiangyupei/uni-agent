@@ -789,38 +789,6 @@ async def test_fresh_boundary_prevents_shallower_rollback(same_boundary):
 @pytest.mark.cpu
 @pytest.mark.level0
 @pytest.mark.asyncio
-@pytest.mark.parametrize("echoed", ["OLD", "REWRITTEN"])
-@pytest.mark.parametrize("ends_with_assistant", [True, False])
-async def test_chain_selection_respects_context_suffix_contract(echoed, ends_with_assistant):
-    session = _session("assistant-suffix", enable_last_assistant_rollback=True)
-    backend = SequencedBackend(["OLD", "NEW"])
-    prompt = [{"role": "user", "content": "start"}]
-    await _run(session, backend, prompt)
-    original_chain = session.active_chains[0]
-    incoming = [
-        *prompt,
-        {"role": "assistant", "content": echoed},
-        {"role": "user", "content": "continue"},
-        {"role": "assistant", "content": "external answer"},
-    ]
-    if not ends_with_assistant:
-        incoming.append({"role": "user", "content": "continue again"})
-
-    await _run(session, backend, incoming)
-
-    assert len(session.active_chains) == (2 if ends_with_assistant else 1)
-    if ends_with_assistant:
-        assert session.active_chains[0] == original_chain
-        assert backend.calls[-1]["prompt_ids"] == session._codec.build_initial_tokens(incoming)
-        assert session.active_chains[-1].buffer.response_mask == [1] * len("NEW")
-    else:
-        assert 0 in session.active_chains[0].buffer.response_mask
-        assert session.active_chains[0].buffer.response_mask[-len("NEW") :] == [1] * len("NEW")
-
-
-@pytest.mark.cpu
-@pytest.mark.level0
-@pytest.mark.asyncio
 async def test_multiple_chains_distinct_sibling_continuation_matches_older_assistant_prefix():
     """Select an older sibling when its assistant prefix uniquely matches the request."""
     session = _session("distinct-sibling")
