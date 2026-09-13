@@ -58,10 +58,10 @@ clip_ratio_high=${CLIP_RATIO_HIGH:-0.28}
 loss_agg_mode=${LOSS_AGG_MODE:-token-mean}
 loss_mode=${LOSS_MODE:-vanilla}
 
-max_prompt_length=${MAX_PROMPT_LENGTH:-131072}
+max_prompt_length=${MAX_PROMPT_LENGTH:-184320}
 max_response_length=${MAX_RESPONSE_LENGTH:-8192}
-max_model_len=${MAX_MODEL_LEN:-139264}
-train_total_length_limit=${TRAIN_TOTAL_LENGTH_LIMIT:-131072}
+max_model_len=${MAX_MODEL_LEN:-196608}
+train_total_length_limit=${TRAIN_TOTAL_LENGTH_LIMIT:-184320}
 total_len=$((max_prompt_length + max_response_length))
 if (( total_len > max_model_len )); then
   echo "MAX_PROMPT_LENGTH + MAX_RESPONSE_LENGTH must not exceed MAX_MODEL_LEN" >&2
@@ -235,6 +235,7 @@ MAIN_CMD=(
   ++actor_rollout_ref.rollout.custom.agent_framework.agent_runners.task.trajectory_selection=all \
   ++actor_rollout_ref.rollout.custom.agent_framework.agent_runners.task.runner_kwargs.task_config_path=${TASK_CONFIG} \
   ++actor_rollout_ref.rollout.custom.agent_framework.agent_runners.task.runner_kwargs.model_name=${SERVED_MODEL_NAME} \
+  ++actor_rollout_ref.rollout.custom.agent_framework.agent_runners.task.runner_kwargs.max_response_length=${max_response_length} \
   "++actor_rollout_ref.rollout.custom.agent_framework.agent_runners.task.runner_kwargs.remote_docker_hosts=${REMOTE_DOCKER_HOSTS_PARSER}" \
   "++actor_rollout_ref.rollout.custom.agent_framework.agent_runners.task.runner_kwargs.evaluator_npu_device_ids=${EVALUATOR_NPU_DEVICE_IDS_PARSER}" \
   ++actor_rollout_ref.rollout.custom.agent_framework.agent_runners.task.runner_kwargs.evaluator_npu_lock_dir=${EVALUATOR_NPU_LOCK_DIR} \

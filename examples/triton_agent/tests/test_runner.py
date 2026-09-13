@@ -74,10 +74,12 @@ def test_npu_lease_rejects_non_positive_or_non_finite_timeout(timeout: float) ->
         )
 
 
-def test_recipe_runner_returns_task_result(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("max_response_length", [None, 8192])
+def test_recipe_runner_returns_task_result(monkeypatch: pytest.MonkeyPatch, max_response_length: int | None) -> None:
     from uni_agent.tasks import TaskResult
 
     captured = {}
+    tools = {"task": {"name": "triton_operator", "metadata": {}, "agent": {"extra_env": {"EXISTING": "1"}}}}
     expected = TaskResult(reward=0.5, accuracy=0.25, finished=True, extra_info={"train_best": {"assistant_index": 0}})
 
     async def fake_run_task(**kwargs):
@@ -92,13 +94,19 @@ def test_recipe_runner_returns_task_result(monkeypatch: pytest.MonkeyPatch) -> N
     result = asyncio.run(
         runner_module.run_triton_task(
             session=session,
-            tools_kwargs={"task": {"name": "triton_operator", "metadata": {}}},
+            tools_kwargs=tools,
             remote_docker_hosts="ssh://sandbox-a",
             evaluator_npu_device_ids="0,1",
+            max_response_length=max_response_length,
         )
     )
 
     assert result is expected
+    expected_env = {"EXISTING": "1"}
+    if max_response_length is not None:
+        expected_env["CLAUDE_CODE_MAX_OUTPUT_TOKENS"] = str(max_response_length)
+    assert captured["tools_kwargs"]["task"]["agent"]["extra_env"] == expected_env
+    assert tools["task"]["agent"]["extra_env"] == {"EXISTING": "1"}
     assert captured["tools_kwargs"]["task"]["metadata"]["runtime"]["session_id"] == "session-1"
     assert captured["tools_kwargs"]["task"]["sandbox"]["sandbox_kwargs"]["docker_host"] == "ssh://sandbox-a"
     assert captured["tools_kwargs"]["task"]["sandbox"]["sandbox_kwargs"]["npu_lock_dir"] == (

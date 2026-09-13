@@ -34,6 +34,7 @@ async def run_triton_task(
     evaluator_npu_device_ids: str,
     evaluator_npu_lock_dir: str = "/var/lock/triton-agent-npu",
     evaluator_npu_lock_timeout: float = 1200.0,
+    max_response_length: int | None = None,
     **kwargs: Any,
 ):
     """Run one Triton task through Uni-Agent's generic Task runner."""
@@ -50,6 +51,9 @@ async def run_triton_task(
     task_config = copied.get("task")
     if not isinstance(task_config, dict):
         raise ValueError("run_triton_task requires tools_kwargs['task']")
+    if max_response_length is not None:
+        extra_env = task_config.setdefault("agent", {}).setdefault("extra_env", {})
+        extra_env["CLAUDE_CODE_MAX_OUTPUT_TOKENS"] = str(max_response_length)
     metadata = task_config.setdefault("metadata", {})
     if not isinstance(metadata, dict):
         raise TypeError("tools_kwargs['task']['metadata'] must be a mapping")
