@@ -513,7 +513,7 @@ def test_missing_impl_and_missing_metrics_are_distinct() -> None:
     assert missing_metrics["metrics"]["error_type"] == "missing_metrics"
 
 
-def test_task_reuses_agent_metrics_without_final_reverify_or_output_reset(tmp_path: Path) -> None:
+def test_task_reuses_agent_metrics_without_final_reverify_or_output_reset(tmp_path: Path, capsys) -> None:
     preserved = b'{"agent-time":true}\n'
     sandbox = FakeSandbox(
         agent_files={
@@ -522,12 +522,17 @@ def test_task_reuses_agent_metrics_without_final_reverify_or_output_reset(tmp_pa
         }
     )
     config = _config(artifact_dir=tmp_path)
+    config.metadata["runtime"] = {"sample_index": 2, "session_id": "session-sample-2-rollout-5-test"}
     task = TritonOperatorTask(config)
     task.build_sandbox = lambda: sandbox  # type: ignore[method-assign]
     task.build_agent = lambda: FakeAgent()  # type: ignore[method-assign]
 
     result = asyncio.run(task.run())
 
+    summary = capsys.readouterr().out
+    assert summary.count("[triton-result]") == 1
+    assert "sample=2 session=session-sample-2-rollout-5-test op=smoke correct=True" in summary
+    assert "reward=0.7000 pass_rate=1.0000 source=metrics finished=True" in summary
     assert sandbox.started and sandbox.stopped
     assert sandbox.cleanup_calls == 2
     assert all("final_verify" not in command for command in sandbox.shell_calls)

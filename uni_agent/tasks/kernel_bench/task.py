@@ -137,14 +137,18 @@ class TritonOperatorTask(Task):
         reward = float(metrics.get("reward", 0.0))
         pass_rate = float(metrics.get("pass_rate", 0.0))
         extra_info = _compact_extra_info(op_name, evaluation, agent_info, metadata=metadata)
-        logger.info(
-            "triton task done: op=%s reward=%.4f pass_rate=%.4f source=%s total_ms=%s",
-            op_name,
-            reward,
-            pass_rate,
-            extra_info.get("selected_metrics_source"),
-            extra_info.get("timing_ms", {}).get("total"),
+        runtime = metadata.get("runtime", {})
+        summary = (
+            f"[triton-result] sample={runtime.get('sample_index')} session={runtime.get('session_id')} "
+            f"op={op_name} correct={metrics.get('correctness_ok', False)} "
+            f"passed={metrics.get('passed_cases', 0)}/{metrics.get('total_cases', 0)} "
+            f"failed={metrics.get('failed_cases', 0)} reward={reward:.4f} pass_rate={pass_rate:.4f} "
+            f"source={evaluation.get('selected_metrics_source')} finished={finished} "
+            f"total_ms={evaluation['timing_ms']['total']}"
         )
+        logger.info(summary)
+        # Session logging is file-scoped; stdout also reaches the Ray job's main log.
+        print(summary, flush=True)
         return TaskResult(reward=reward, accuracy=pass_rate, finished=finished, extra_info=extra_info)
 
     async def _run_attempt(
