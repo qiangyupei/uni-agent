@@ -27,10 +27,6 @@ verl LLMServerManager
 
 Use this path when inference must match training or when trajectories are needed as training data.
 
-## Output Limits
-
-`actor_rollout_ref.rollout.response_length` caps each Gateway generation's output tokens. The Gateway forwards the minimum of the client's `max_tokens`, the configured `response_length`, and the remaining chain capacity (`prompt_length + response_length - context_tokens`), considering only configured limits. The per-call cap also applies when `prompt_length` is unset; omitting `response_length` preserves the existing behavior. This limits generation, not post-generation truncation, and does not cap cumulative output across turns at `response_length`.
-
 ## Session Lifecycle
 
 For each rollout session, the Agent Framework:
@@ -298,6 +294,10 @@ Important knobs include:
 - `rollout.n`: sessions per prompt.
 - `rollout.multi_turn.format`: model-specific Tool parser.
 - `transfer_queue.enable`: enables asynchronous trajectory storage.
+- `rollout.response_length`: caps output tokens per Gateway generation call. The Gateway
+forwards the minimum of the client's `max_tokens`, the configured `response_length`,
+and the remaining chain capacity (`prompt_length + response_length - context_tokens`),
+considering only configured limits.
 
 ## Extension Boundaries
 
