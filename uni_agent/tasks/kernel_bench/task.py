@@ -313,7 +313,7 @@ class TritonOperatorTask(Task):
 
     async def _install_transcript_hooks(self, sandbox: Sandbox, cfg: TritonOperatorTaskConfig) -> None:
         workspace = cfg.workspace_dir
-        hook_source = (Path(__file__).with_name("assets") / "track_verify_snapshot.py").read_bytes()
+        hook_source = Path(__file__).with_name("track_verify_snapshot.py").read_bytes()
         hook_path = f"{workspace}/.claude/hooks/track_verify_snapshot.py"
         policy_path = f"{workspace}/.claude/hooks/triton_verify_policy.json"
         created = await sandbox.exec(["mkdir", "-p", f"{workspace}/.claude/hooks"], timeout=10)

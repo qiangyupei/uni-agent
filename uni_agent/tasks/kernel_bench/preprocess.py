@@ -1,7 +1,6 @@
 """Prepare deterministic, leakage-free KernelBench datasets.
 
 This script consumes local source trees and emits datasets ready for training.
-An optional manifest can validate provenance for audited runs.
 """
 
 from __future__ import annotations
@@ -857,84 +856,6 @@ def write_rows(rows: list[dict[str, Any]], path: Path) -> None:
     Dataset.from_list(rows).to_parquet(str(path))
 
 
-def source_tree_sha256(
-    paths: list[Path] | tuple[Path, ...],
-    *,
-    exclude_paths: set[Path] | None = None,
-) -> str:
-    """Hash reviewed source files deterministically, independent of absolute paths."""
-
-    roots: list[Path] = []
-    seen: set[Path] = set()
-    for candidate in paths:
-        if candidate.is_symlink():
-            raise ValueError(f"source root cannot be a symlink: {candidate}")
-        root = candidate.resolve(strict=True)
-        if root not in seen:
-            roots.append(root)
-            seen.add(root)
-    if not roots:
-        raise ValueError("at least one source path is required")
-
-    digest = hashlib.sha256()
-    file_count = 0
-    excluded = {path.resolve() for path in (exclude_paths or set())}
-    for root_index, root in enumerate(roots):
-        candidates = [root] if root.is_file() else sorted(root.rglob("*"))
-        for candidate in candidates:
-            if candidate.is_symlink():
-                raise ValueError(f"source tree contains a symlink: {candidate}")
-            if candidate.resolve() in excluded:
-                continue
-            if candidate.is_dir() or "__pycache__" in candidate.parts or candidate.suffix == ".pyc":
-                continue
-            if not candidate.is_file():
-                raise ValueError(f"source tree contains a non-regular file: {candidate}")
-            relative = candidate.name if root.is_file() else candidate.relative_to(root).as_posix()
-            digest.update(f"root-{root_index}/{relative}".encode())
-            digest.update(b"\0")
-            with candidate.open("rb") as handle:
-                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-                    digest.update(chunk)
-            digest.update(b"\0")
-            file_count += 1
-    if file_count == 0:
-        raise ValueError("source paths contain no regular files")
-    return digest.hexdigest()
-
-
-def validate_source_manifest(
-    path: Path,
-    *,
-    dataset_name: str,
-    dataset_revision: str,
-    source_paths: list[Path] | tuple[Path, ...] | None = None,
-) -> dict[str, Any]:
-    """Validate provenance metadata and, when supplied, the reviewed source bytes."""
-
-    manifest = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(manifest, dict):
-        raise TypeError("data source manifest must be a JSON object")
-    required = ("name", "revision", "source_url", "sha256", "license", "license_url")
-    missing = [key for key in required if not str(manifest.get(key, "")).strip()]
-    if missing:
-        raise ValueError(f"data source manifest is missing required fields: {missing}")
-    if manifest["name"] != dataset_name or manifest["revision"] != dataset_revision:
-        raise ValueError("manifest name/revision does not match command-line dataset identity")
-    claimed_digest = str(manifest["sha256"]).lower()
-    if not re.fullmatch(r"[0-9a-f]{64}", claimed_digest) or claimed_digest == "0" * 64:
-        raise ValueError("manifest.sha256 must be a non-zero 64-character hexadecimal digest")
-    if source_paths is not None:
-        actual_digest = source_tree_sha256(source_paths, exclude_paths={path})
-        if claimed_digest != actual_digest:
-            raise ValueError(
-                "manifest.sha256 does not match the reviewed train/validation sources: "
-                f"expected {claimed_digest}, got {actual_digest}"
-            )
-        manifest = {**manifest, "sha256": claimed_digest, "verified_source_sha256": actual_digest}
-    return manifest
-
-
 def _fingerprint(code: str, support_files: dict[str, str]) -> str:
     digest = hashlib.sha256()
     digest.update(code.encode("utf-8"))
@@ -1024,7 +945,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--validation-source", type=Path, required=True)
     parser.add_argument("--dataset-name")
     parser.add_argument("--dataset-revision", default="local")
-    parser.add_argument("--source-manifest", type=Path)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--format", choices=("parquet", "jsonl"), default="parquet")
     parser.add_argument("--arch", default="ascend910b1")
@@ -1057,14 +977,6 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     dataset_name = args.dataset_name or args.dataset_kind
-    manifest = None
-    if args.source_manifest:
-        manifest = validate_source_manifest(
-            args.source_manifest,
-            dataset_name=dataset_name,
-            dataset_revision=args.dataset_revision,
-            source_paths=[args.train_source, args.validation_source],
-        )
     if args.dataset_kind == "drkernel":
         levels = {int(value.strip()) for value in args.drkernel_validation_levels.split(",") if value.strip()} or None
         train_records = discover_drkernel_records(
@@ -1144,9 +1056,6 @@ def main() -> None:
             "\n".join(sorted(row["uid"] for row in validation)).encode()
         ).hexdigest(),
     }
-    if manifest:
-        summary["source_manifest_sha256"] = hashlib.sha256(args.source_manifest.read_bytes()).hexdigest()
-        summary["verified_source_sha256"] = manifest["verified_source_sha256"]
     (args.output_dir / "dataset_summary.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
     print(json.dumps(summary, indent=2))
 

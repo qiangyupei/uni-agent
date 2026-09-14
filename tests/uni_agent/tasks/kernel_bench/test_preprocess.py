@@ -18,9 +18,7 @@ from uni_agent.tasks.kernel_bench.preprocess import (
     main,
     select_benchmark_levels,
     select_records,
-    source_tree_sha256,
     stable_uid,
-    validate_source_manifest,
 )
 
 
@@ -68,51 +66,6 @@ def test_uid_changes_with_emitted_arch_semantics(tmp_path: Path) -> None:
     )
 
     assert default != different_arch
-
-
-def test_manifest_verifies_reviewed_source_tree_and_rejects_placeholders(tmp_path: Path) -> None:
-    train = tmp_path / "train"
-    validation = tmp_path / "validation"
-    write_task(train, "add", "REFERENCE = 'add'\n")
-    write_task(validation, "mul", "REFERENCE = 'mul'\n")
-    digest = source_tree_sha256([train, validation])
-    manifest = {
-        "name": "bench",
-        "revision": "r1",
-        "source_url": "https://example.invalid/source.tar.gz",
-        "sha256": digest,
-        "license": "reviewed",
-        "license_url": "https://example.invalid/LICENSE",
-    }
-    manifest_path = tmp_path / "manifest.json"
-    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
-
-    verified = validate_source_manifest(
-        manifest_path,
-        dataset_name="bench",
-        dataset_revision="r1",
-        source_paths=[train, validation],
-    )
-    assert verified["verified_source_sha256"] == digest
-
-    (train / "add.py").write_text("REFERENCE = 'changed'\n", encoding="utf-8")
-    with pytest.raises(ValueError, match="does not match"):
-        validate_source_manifest(
-            manifest_path,
-            dataset_name="bench",
-            dataset_revision="r1",
-            source_paths=[train, validation],
-        )
-
-    manifest["sha256"] = "0" * 64
-    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
-    with pytest.raises(ValueError, match="64-character"):
-        validate_source_manifest(
-            manifest_path,
-            dataset_name="bench",
-            dataset_revision="r1",
-            source_paths=[train, validation],
-        )
 
 
 def test_minimal_cli_prepares_training_data_without_manifest(
