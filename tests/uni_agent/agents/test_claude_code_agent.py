@@ -130,7 +130,10 @@ def test_ensure_claude_requires_binary_on_path_after_install():
 
 @pytest.mark.cpu
 @pytest.mark.level0
-def test_run_forwards_workdir():
+@pytest.mark.parametrize(
+    "system_contents", [[], [None], [""], [" \n"], ["Follow the task rules."], ["First", "Second"]]
+)
+def test_run_forwards_workdir(system_contents):
     config = ClaudeCodeConfig(
         model=ModelConfig(
             base_url="https://ark.example/api/compatible",
@@ -145,7 +148,7 @@ def test_run_forwards_workdir():
         ClaudeCodeAgent(config).run(
             sandbox=sandbox,
             messages=[
-                {"role": "system", "content": "ignored system prompt"},
+                *[{"role": "system", "content": content} for content in system_contents],
                 {"role": "user", "content": "fix the bug"},
             ],
             workdir="/testbed",
@@ -159,6 +162,12 @@ def test_run_forwards_workdir():
     argv = sandbox.exec_calls[0]["argv"]
     assert argv[:2] == ["claude", "-p"]
     assert argv[2] == "fix the bug"
+    system_prompt = "\n\n".join(content for content in system_contents if content and content.strip())
+    if system_prompt:
+        assert argv.count("--system-prompt") == 1
+        assert argv[argv.index("--system-prompt") + 1] == system_prompt
+    else:
+        assert "--system-prompt" not in argv
     assert argv[argv.index("--model") + 1] == "policy"
     assert argv[argv.index("--permission-mode") + 1] == "bypassPermissions"
     assert "--bare" not in argv
@@ -180,9 +189,11 @@ def test_run_forwards_workdir():
 
 @pytest.mark.cpu
 @pytest.mark.level0
-def test_run_accepts_user_only_message_without_rewriting():
+@pytest.mark.parametrize("extra_args", [[], ["--system-prompt", "Explicit override"]])
+def test_run_accepts_user_only_message_without_rewriting(extra_args):
     config = ClaudeCodeConfig(
         model=ModelConfig(base_url="http://gateway:8000/v1", model_name="policy"),
+        extra_args=extra_args,
     )
     sandbox = _FakeSandbox(probe_results=[0])
     prompt = (
@@ -199,6 +210,33 @@ def test_run_accepts_user_only_message_without_rewriting():
     )
 
     assert sandbox.exec_calls[0]["argv"][2] == prompt
+    if extra_args:
+        assert sandbox.exec_calls[0]["argv"][-len(extra_args) :] == extra_args
+
+
+@pytest.mark.cpu
+@pytest.mark.level0
+@pytest.mark.parametrize(
+    "content,extra_args,error",
+    [
+        ([], [], "text system messages"),
+        ("Rules", ["--system-prompt", "Other"], "conflict"),
+        ("Rules", ["--system-prompt-file=rules.txt"], "conflict"),
+    ],
+)
+def test_run_rejects_invalid_system_prompt(content, extra_args, error):
+    config = ClaudeCodeConfig(
+        model=ModelConfig(base_url="http://gateway/v1", model_name="policy"), extra_args=extra_args
+    )
+    sandbox = _FakeSandbox(probe_results=[])
+    with pytest.raises(ValueError, match=error):
+        asyncio.run(
+            ClaudeCodeAgent(config).run(
+                sandbox=sandbox,
+                messages=[{"role": "system", "content": content}, {"role": "user", "content": "Fix the bug"}],
+            )
+        )
+    assert not sandbox.calls and not sandbox.exec_calls
 
 
 @pytest.mark.cpu
