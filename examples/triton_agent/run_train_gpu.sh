@@ -152,7 +152,6 @@ MAIN_CMD=(
   algorithm.use_kl_in_reward=${use_kl_in_reward} \
   algorithm.kl_ctrl.kl_coef=${kl_coef} \
   actor_rollout_ref.model.path="${MODEL_PATH}" \
-  +actor_rollout_ref.model.override_config.model_config.max_position_embeddings=${total_len} \
   actor_rollout_ref.model.use_remove_padding=True \
   actor_rollout_ref.actor.use_kl_loss=${use_kl_loss} \
   actor_rollout_ref.actor.kl_loss_coef=${kl_loss_coef} \
@@ -300,4 +299,4 @@ MAIN_CMD=(
 )
 
 ray job submit --working-dir="${WORKING_DIR}" "${RUNTIME_ENV_ARGS[@]}" \
-  -- env RAY_OVERRIDE_JOB_RUNTIME_ENV=1 "${MAIN_CMD[@]}" 2>&1 | tee -i "logs/${project_name}/${exp_name}.log"
+  -- env RAY_OVERRIDE_JOB_RUNTIME_ENV=1 "${MAIN_CMD[@]}" 2>&1 | tee -i "${LOG_DIR}/${exp_name}.log"
