@@ -162,6 +162,7 @@ class _GatewayActor:
         """Validate an OpenAI Chat Completions payload and serialize the session outcome."""
         session = self._sessions.get(session_id)
         if session is None:
+            log_request_stage("session_not_found")
             raise HTTPException(status_code=404, detail=f"Unknown session_id: {session_id}")
 
         try:
@@ -194,6 +195,7 @@ class _GatewayActor:
         """Validate an Anthropic Messages payload and serialize the session outcome."""
         session = self._sessions.get(session_id)
         if session is None:
+            log_request_stage("session_not_found")
             raise HTTPException(status_code=404, detail=f"Unknown session_id: {session_id}")
 
         try:

@@ -32,7 +32,15 @@ def test_request_logging_preserves_transport_and_cleans_context(mode, caplog):
     async def run():
         try:
             await RequestLoggingMiddleware(app)(
-                {"type": "http", "path": "/sessions/session-test/v1/messages"}, receive, send
+                {
+                    "type": "http",
+                    "method": "POST",
+                    "path": "/sessions/session-test/v1/messages",
+                    "query_string": b"key=private-query",
+                    "headers": [(b"authorization", b"private-token")],
+                },
+                receive,
+                send,
             )
         finally:
             assert _request.get() is None
@@ -53,8 +61,34 @@ def test_request_logging_preserves_transport_and_cleans_context(mode, caplog):
     assert "event=request_end" in caplog.text
     assert "session=session-test" in caplog.text
     assert "stage_elapsed_s=" in caplog.text
+    assert "'method': 'POST'" in caplog.text
+    assert "'path': '/sessions/session-test/v1/messages'" in caplog.text
     assert "private-" not in caplog.text
     if mode == "complete":
         assert sent[-1]["body"] == b"private-response"
         assert "event=response_headers_sending" in caplog.text
         assert "event=response_first_body_sending" in caplog.text
+
+
+@pytest.mark.parametrize("path,reason", [("messages", "handler_not_found"), ("unknown", "route_not_found")])
+def test_not_found_route_diagnostics(path, reason, caplog):
+    import httpx
+    from fastapi import FastAPI, HTTPException
+
+    caplog.set_level(logging.INFO, logger="gateway.requests")
+    app = FastAPI()
+    app.add_middleware(RequestLoggingMiddleware)
+
+    @app.post("/sessions/{session_id}/v1/messages")
+    async def missing_session(session_id: str):
+        log_request_stage("session_not_found")
+        raise HTTPException(status_code=404)
+
+    async def run():
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+            response = await client.post(f"/sessions/test/v1/{path}")
+            assert response.status_code == 404
+
+    asyncio.run(run())
+    assert f"'not_found_reason': '{reason}'" in caplog.text
+    assert ("event=session_not_found" in caplog.text) == (path == "messages")

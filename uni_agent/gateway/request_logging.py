@@ -52,7 +52,7 @@ class RequestLoggingMiddleware:
             "stage_started": started,
         }
         token = _request.set(context)
-        log_request_stage("received")
+        log_request_stage("received", method=scope.get("method"), path=path)
         status = None
         complete = False
         first_body = True
@@ -73,7 +73,15 @@ class RequestLoggingMiddleware:
         async def traced_send(message):
             nonlocal status, complete, first_body
             if message["type"] == "http.response.start":
-                log_request_stage("response_headers_sending", status=message["status"])
+                route = scope.get("route")
+                log_request_stage(
+                    "response_headers_sending",
+                    status=message["status"],
+                    route=getattr(route, "path", None),
+                    not_found_reason=("route_not_found" if route is None else "handler_not_found")
+                    if message["status"] == 404
+                    else None,
+                )
             elif message["type"] == "http.response.body" and first_body:
                 log_request_stage("response_first_body_sending")
             await send(message)
