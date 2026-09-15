@@ -104,11 +104,17 @@ class ClaudeCodeAgent(Agent):
         base_url = cfg.model.base_url
         if not base_url:
             raise ValueError("claude_code: config.model.base_url is not set (the gateway/vLLM policy endpoint)")
-        user_messages = [message.get("content") for message in messages if message.get("role") == "user"]
-        if len(user_messages) != 1:
-            raise ValueError("claude_code requires exactly one 'user' message")
-        user_prompt = user_messages[0]
-        if not isinstance(user_prompt, str) or not user_prompt.strip():
+        user_parts = []
+        for message in messages:
+            if message.get("role") != "user" or message.get("content") is None:
+                continue
+            content = message["content"]
+            if not isinstance(content, str):
+                raise ValueError("claude_code requires text user messages")
+            if content.strip():
+                user_parts.append(content)
+        user_prompt = "\n\n".join(user_parts)
+        if not user_prompt:
             raise ValueError("claude_code requires a non-empty user prompt")
 
         system_parts = []

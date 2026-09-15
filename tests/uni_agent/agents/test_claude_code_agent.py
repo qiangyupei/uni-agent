@@ -241,19 +241,63 @@ def test_run_rejects_invalid_system_prompt(content, extra_args, error):
 
 @pytest.mark.cpu
 @pytest.mark.level0
-def test_run_requires_exactly_one_user_message():
+def test_run_joins_user_messages_in_order_without_rewriting():
+    config = ClaudeCodeConfig(
+        model=ModelConfig(base_url="http://gateway:8000/v1", model_name="policy"),
+    )
+    sandbox = _FakeSandbox(probe_results=[0])
+
+    asyncio.run(
+        ClaudeCodeAgent(config).run(
+            sandbox=sandbox,
+            messages=[
+                {"role": "user", "content": "  Inspect the repository.\n"},
+                {"role": "system", "content": "Follow the task rules."},
+                {"role": "user"},
+                {"role": "user", "content": None},
+                {"role": "user", "content": ""},
+                {"role": "user", "content": " \n"},
+                {"role": "user", "content": "Fix the bug.\nRun the tests.  "},
+                {"role": "system", "content": "Report the result."},
+            ],
+        )
+    )
+
+    argv = sandbox.exec_calls[0]["argv"]
+    assert argv[:3] == ["claude", "-p", "  Inspect the repository.\n\n\nFix the bug.\nRun the tests.  "]
+    assert argv[argv.index("--system-prompt") + 1] == "Follow the task rules.\n\nReport the result."
+
+
+@pytest.mark.cpu
+@pytest.mark.level0
+@pytest.mark.parametrize(
+    "user_messages,error",
+    [
+        ([], "non-empty user prompt"),
+        ([{"role": "user"}], "non-empty user prompt"),
+        ([{"role": "user", "content": None}], "non-empty user prompt"),
+        ([{"role": "user", "content": ""}, {"role": "user", "content": " \n"}], "non-empty user prompt"),
+        ([{"role": "user", "content": []}], "text user messages"),
+        (
+            [{"role": "user", "content": "Fix the bug"}, {"role": "user", "content": 123}],
+            "text user messages",
+        ),
+    ],
+)
+def test_run_rejects_invalid_user_prompt(user_messages, error):
     config = ClaudeCodeConfig(
         model=ModelConfig(base_url="http://gateway:8000/v1", model_name="policy"),
     )
     sandbox = _FakeSandbox(probe_results=[])
 
-    with pytest.raises(ValueError, match="exactly one 'user' message"):
+    with pytest.raises(ValueError, match=error):
         asyncio.run(
             ClaudeCodeAgent(config).run(
                 sandbox=sandbox,
-                messages=[{"role": "system", "content": "system prompt"}],
+                messages=[{"role": "system", "content": "system prompt"}, *user_messages],
             )
         )
+    assert not sandbox.calls and not sandbox.exec_calls
 
 
 @pytest.mark.cpu
