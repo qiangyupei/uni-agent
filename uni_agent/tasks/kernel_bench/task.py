@@ -192,6 +192,9 @@ class TritonOperatorTask(Task):
                 # This also releases any evaluator NPU lease.
                 await self._cleanup_task_processes(sandbox, cfg, workspace, required=True)
                 early_stop = await _read_early_stop(sandbox, workspace)
+                agent_info["verify_progress"] = await _read_json(
+                    sandbox, f"{workspace}/.triton_verify_patience.json", max_bytes=4096
+                )
                 evaluate_started = time.monotonic()
                 evaluation = await self._evaluate_workspace(
                     sandbox,

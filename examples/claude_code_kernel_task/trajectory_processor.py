@@ -119,7 +119,33 @@ def process_trajectories(
 
     if not selected:
         return _on_empty(source, empty_policy, "no assistant prefix fits the configured limit")
-    return selected
+    best = task_info.get("train_best")
+    best = best if isinstance(best, Mapping) else {}
+    best_index = _as_int_or_none(best.get("assistant_index"))
+    messages_seen = _as_int_or_none(best.get("assistant_messages_seen"))
+    if best_index is None and messages_seen is not None:
+        best_index = messages_seen - 1
+    agent = task_info.get("agent") or {}
+    progress = agent.get("verify_progress") or {}
+    stop = agent.get("early_stop") or {}
+    result = []
+    for trajectory in selected:
+        extra = dict(trajectory.extra_fields)
+        reason = extra.get("trajectory_postprocess_reason")
+        used_best = reason in {"best_assistant", "best_previous_valid_assistant"}
+        extra["kernel_bench_diagnostics"] = {
+            "best_assistant_index": best_index,
+            "selection_requested": selection,
+            "selection_applied": "best_prefix" if used_best else "fallback" if selection == "best" else selection,
+            "postprocess_reason": reason,
+            "selected_assistant_index": extra.get("assistant_spans_kept", 0) - 1,
+            "verify_count": progress.get("verify_count"),
+            "correctness_stale_verify_count": progress.get("correctness_stale_verify_count"),
+            "latency_stale_verify_count": progress.get("latency_stale_verify_count"),
+            "early_stop_reason": stop.get("reason"),
+        }
+        result.append(replace(trajectory, extra_fields=extra))
+    return result
 
 
 def assistant_spans(trajectory: Trajectory) -> list[tuple[int, int]]:

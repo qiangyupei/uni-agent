@@ -515,10 +515,12 @@ def test_missing_impl_and_missing_metrics_are_distinct() -> None:
 
 def test_task_reuses_agent_metrics_without_final_reverify_or_output_reset(tmp_path: Path, capsys) -> None:
     preserved = b'{"agent-time":true}\n'
+    progress = {"verify_count": 5, "correctness_stale_verify_count": 0, "latency_stale_verify_count": 2}
     sandbox = FakeSandbox(
         agent_files={
             "/workspace/metrics.json": _json_bytes(_metrics()),
             "/workspace/output/verify/agent-controlled.json": preserved,
+            "/workspace/.triton_verify_patience.json": _json_bytes(progress),
         }
     )
     config = _config(artifact_dir=tmp_path)
@@ -542,6 +544,7 @@ def test_task_reuses_agent_metrics_without_final_reverify_or_output_reset(tmp_pa
     assert result.reward == 0.7
     assert result.extra_info is not None
     assert result.extra_info["selected_metrics_source"] == "metrics"
+    assert result.extra_info["agent"]["verify_progress"] == progress
     assert result.extra_info["metrics"]["reward_components"]["total"] == 0.7
     assert "task_code" not in result.extra_info
     settings = json.loads(sandbox.files["/workspace/.claude/settings.json"])
