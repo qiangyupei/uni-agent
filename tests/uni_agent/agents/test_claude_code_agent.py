@@ -131,9 +131,17 @@ def test_ensure_claude_requires_binary_on_path_after_install():
 @pytest.mark.cpu
 @pytest.mark.level0
 @pytest.mark.parametrize(
-    "system_contents", [[], [None], [""], [" \n"], ["Follow the task rules."], ["First", "Second"]]
+    "system_contents,expected_system_prompt",
+    [
+        ([], ""),
+        ([None], ""),
+        ([""], ""),
+        ([" \n"], ""),
+        (["Follow the task rules."], "Follow the task rules."),
+        (["First", "Second"], "First\n\nSecond"),
+    ],
 )
-def test_run_forwards_workdir(system_contents):
+def test_run_forwards_workdir(system_contents, expected_system_prompt):
     config = ClaudeCodeConfig(
         model=ModelConfig(
             base_url="https://ark.example/api/compatible",
@@ -162,10 +170,9 @@ def test_run_forwards_workdir(system_contents):
     argv = sandbox.exec_calls[0]["argv"]
     assert argv[:2] == ["claude", "-p"]
     assert argv[2] == "fix the bug"
-    system_prompt = "\n\n".join(content for content in system_contents if content and content.strip())
-    if system_prompt:
+    if expected_system_prompt:
         assert argv.count("--system-prompt") == 1
-        assert argv[argv.index("--system-prompt") + 1] == system_prompt
+        assert argv[argv.index("--system-prompt") + 1] == expected_system_prompt
     else:
         assert "--system-prompt" not in argv
     assert argv[argv.index("--model") + 1] == "policy"
@@ -274,9 +281,10 @@ def test_run_joins_user_messages_in_order_without_rewriting():
     "user_messages,error",
     [
         ([], "non-empty user prompt"),
-        ([{"role": "user"}], "non-empty user prompt"),
-        ([{"role": "user", "content": None}], "non-empty user prompt"),
-        ([{"role": "user", "content": ""}, {"role": "user", "content": " \n"}], "non-empty user prompt"),
+        (
+            [{"role": "user"}, *[{"role": "user", "content": content} for content in (None, "", " \n")]],
+            "non-empty user prompt",
+        ),
         ([{"role": "user", "content": []}], "text user messages"),
         (
             [{"role": "user", "content": "Fix the bug"}, {"role": "user", "content": 123}],
