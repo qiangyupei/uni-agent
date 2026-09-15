@@ -29,6 +29,7 @@ from uni_agent.gateway.adapters.openai import (
 )
 from uni_agent.gateway.adapters.types import AnthropicRequest, MalformedRequestError, OpenAIChatCompletionRequest
 from uni_agent.gateway.config import GatewayActorConfig
+from uni_agent.gateway.request_logging import RequestLoggingMiddleware
 from uni_agent.gateway.session import (
     GatewaySession,
     MessageCodec,
@@ -86,6 +87,7 @@ class _GatewayActor:
         self._enable_last_assistant_rollback = config.enable_last_assistant_rollback
         self._sessions: dict[str, GatewaySession] = {}
         self._app = FastAPI()
+        self._app.add_middleware(RequestLoggingMiddleware)
         self._server_port: int | None = None
         self._server_task: asyncio.Task | None = None
         self._server_base_url: str | None = None

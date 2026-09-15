@@ -12,6 +12,7 @@ from typing import Any
 
 from fastapi import HTTPException
 
+from uni_agent.gateway.request_logging import log_request_stage
 from uni_agent.gateway.session.codec import MessageCodec
 from uni_agent.gateway.session.types import InternalGenerationRequest, SessionHandle, Trajectory
 from uni_agent.rl_insight.adapter import start_generation_span
@@ -236,8 +237,10 @@ class GatewaySession:
         # RewardLoopWorker treats as the session's final scoring input.
         reserved_chain_id: int | None = None
         generation_span = start_generation_span(self._trace_identity)
+        log_request_stage("prepare_wait")
         try:
             async with self.request_lock:
+                log_request_stage("prepare_start")
                 if self.phase != SessionPhase.ACTIVE:
                     raise HTTPException(
                         status_code=409,
@@ -246,6 +249,13 @@ class GatewaySession:
                 # Prepare can touch codec and multimodal extractor state, so only
                 # backend generation runs outside the session lock.
                 encoded = await self._prepare_generation_inputs(request)
+                log_request_stage(
+                    "prepare_complete",
+                    chain_id=encoded.chain_id,
+                    context_tokens=len(encoded.context_ids),
+                    max_tokens=encoded.sampling_params.get("max_tokens"),
+                    capacity_exhausted=encoded.capacity_exhausted,
+                )
                 if encoded.capacity_exhausted:
                     empty_msg = {"role": "assistant", "content": ""}
                     if encoded.chain_id is not None:
@@ -266,6 +276,7 @@ class GatewaySession:
                     reserved_chain_id = encoded.chain_id
 
             try:
+                log_request_stage("backend_start", backend_request_id=self.handle.session_id)
                 output = await backend.generate(
                     request_id=self.handle.session_id,
                     prompt_ids=encoded.context_ids,
@@ -274,9 +285,14 @@ class GatewaySession:
                     video_data=encoded.video_data,
                     mm_processor_kwargs=encoded.mm_processor_kwargs,
                 )
+                log_request_stage(
+                    "backend_complete", output_tokens=len(output.token_ids), stop_reason=output.stop_reason
+                )
             except ValueError as e:
+                log_request_stage("backend_error", error_type=type(e).__name__)
                 raise HTTPException(status_code=400, detail=str(e)) from e
             except Exception as e:
+                log_request_stage("backend_error", error_type=type(e).__name__)
                 raise HTTPException(status_code=500, detail=f"{e.__class__.__name__}: {e}") from e
 
             response_ids = list(output.token_ids)
@@ -321,7 +337,9 @@ class GatewaySession:
             if routed_experts is not None:
                 encoded.buffer.routed_experts = routed_experts
 
+            log_request_stage("commit_wait")
             async with self.request_lock:
+                log_request_stage("decode_start")
                 if self.phase != SessionPhase.ACTIVE:
                     raise HTTPException(
                         status_code=409,
@@ -336,6 +354,7 @@ class GatewaySession:
                     stop_reason=output.stop_reason,
                 )
                 chain_id = self._commit_generation_to_chain(encoded, assistant_msg)
+                log_request_stage("generation_complete", chain_id=chain_id, finish_reason=finish_reason)
                 if reserved_chain_id is not None:
                     self.reserved_chain_ids.discard(reserved_chain_id)
                     reserved_chain_id = None
