@@ -124,6 +124,6 @@ The postprocessor selects best-prefix trajectories at assistant boundaries. Mult
 
 Each completed Task prints one `[triton-result]` line to the Ray job's main log and session logger, including sample/session identity, operator name, passed/total cases, reward, metric source and completion status. This reports the selected verification snapshot, not whether the framework later retains the trajectory. Tasks that raise before returning a result are reported through the existing exception logs.
 
-Launchers save the main log under `LOG_DIR/<experiment>.log`. Per-session logs are under `AGENT_LOG_DIR/step_<n>/<session_id>/`: `task.log`, `framework.log`, and, when trajectory dumping is reached, `trajectory.json` / `trajectory.npz`.
+The GPU launcher saves the main log under `LOG_DIR/<experiment>.log`. Both launchers save per-session logs under `LOG_DIR/<experiment>/step_<n>/<session_id>/`: `task.log`, `framework.log`, and, when trajectory dumping is reached, `trajectory.json` / `trajectory.npz`. `AGENT_LOG_DIR` is derived from `LOG_DIR` and is not a separate environment override. Ray workers must have access to the same filesystem for these files to appear together.
 
 Claude stdout/stderr logging contains only tails, not a full transcript. `artifact_dir` is disabled by default; enable it in the task YAML to export selected metrics JSON and implementation files before sandbox destruction. It does not export full Claude transcripts or raw verifier logs. In multi-node runs, use shared storage or collect artifacts from each runner host.

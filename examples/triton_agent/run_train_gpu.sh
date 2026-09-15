@@ -23,7 +23,7 @@ CKPTS_DIR=${CKPTS_DIR:-"${DATA_HOME}/ckpts/${project_name}/${exp_name}"}
 mkdir -p "${CKPTS_DIR}"
 LOG_DIR=${LOG_DIR:-"${DATA_HOME}/logs/${project_name}"}
 mkdir -p "${LOG_DIR}"
-AGENT_LOG_DIR=${AGENT_LOG_DIR:-"${DATA_HOME}/logs/${project_name}/${exp_name}"}
+AGENT_LOG_DIR="${LOG_DIR}/${exp_name}"
 TRAIN_FILE=${TRAIN_FILE:-"${DATA_HOME}/data/triton-agent/train.parquet"}
 VAL_FILE=${VAL_FILE:-"${DATA_HOME}/data/triton-agent/validation.parquet"}
 RUNTIME_ENV=${RUNTIME_ENV:-}
@@ -220,7 +220,7 @@ MAIN_CMD=(
   actor_rollout_ref.rollout.agent.num_workers=${AGENT_WORKERS} \
   ++actor_rollout_ref.rollout.agent.agent_loop_manager_class=uni_agent.framework.entry.AgentFrameworkRolloutAdapter \
   ++actor_rollout_ref.rollout.custom.agent_framework.gateway_count=${GATEWAY_COUNT} \
-  ++actor_rollout_ref.rollout.custom.agent_framework.log_dir=${AGENT_LOG_DIR} \
+  "++actor_rollout_ref.rollout.custom.agent_framework.log_dir=${AGENT_LOG_DIR}" \
   ++actor_rollout_ref.rollout.custom.agent_framework.use_reward_loop_worker=False \
   ++actor_rollout_ref.rollout.custom.agent_framework.trajectory_postprocessor_fqn=examples.triton_agent.trajectory_processor.process_trajectories \
   ++actor_rollout_ref.rollout.custom.agent_framework.trajectory_postprocessor_kwargs.selection=best \
