@@ -6,7 +6,7 @@ REPO_ROOT="${REPO_ROOT:-$(cd "${SCRIPT_DIR}/../.." && pwd)}"
 cd "${REPO_ROOT}"
 
 # Keep this aligned with examples/quickstart/training/train_npu_qwen3_moe.sh.
-RECIPE_DIR="examples/triton_agent"
+RECIPE_DIR="examples/claude_code_kernel_task"
 NNODES=${NNODES:-16}
 NGPUS_PER_NODE=${NGPUS_PER_NODE:-16}
 
@@ -160,15 +160,15 @@ MAIN_CMD=(
   ++actor_rollout_ref.rollout.agent.agent_loop_manager_class=uni_agent.framework.entry.AgentFrameworkRolloutAdapter \
   ++actor_rollout_ref.rollout.custom.agent_framework.gateway_count=${GATEWAY_COUNT} \
   "++actor_rollout_ref.rollout.custom.agent_framework.log_dir=${AGENT_LOG_DIR}" \
-  ++actor_rollout_ref.rollout.custom.agent_framework.framework_class_fqn=examples.kernel_agent.framework.KernelAgentFramework \
+  ++actor_rollout_ref.rollout.custom.agent_framework.framework_class_fqn=examples.claude_code_kernel_task.framework.KernelAgentFramework \
   ++actor_rollout_ref.rollout.custom.agent_framework.use_reward_loop_worker=False \
-  ++actor_rollout_ref.rollout.custom.agent_framework.trajectory_postprocessor_fqn=examples.triton_agent.trajectory_processor.process_trajectories \
+  ++actor_rollout_ref.rollout.custom.agent_framework.trajectory_postprocessor_fqn=examples.claude_code_kernel_task.trajectory_processor.process_trajectories \
   ++actor_rollout_ref.rollout.custom.agent_framework.trajectory_postprocessor_kwargs.selection=best \
   ++actor_rollout_ref.rollout.custom.agent_framework.trajectory_postprocessor_kwargs.best_fallback=all_final \
   ++actor_rollout_ref.rollout.custom.agent_framework.trajectory_postprocessor_kwargs.max_total_tokens=${total_len} \
   ++actor_rollout_ref.rollout.custom.agent_framework.trajectory_postprocessor_kwargs.drop_no_impl=True \
   ++actor_rollout_ref.rollout.custom.agent_framework.trajectory_postprocessor_kwargs.empty_policy=drop \
-  ++actor_rollout_ref.rollout.custom.agent_framework.agent_runners.task.runner_fqn=examples.triton_agent.runner.run_triton_task \
+  ++actor_rollout_ref.rollout.custom.agent_framework.agent_runners.task.runner_fqn=examples.claude_code_kernel_task.runner.run_triton_task \
   ++actor_rollout_ref.rollout.custom.agent_framework.agent_runners.task.dispatch_mode=ray_task \
   ++actor_rollout_ref.rollout.custom.agent_framework.agent_runners.task.max_concurrent_sessions=${MAX_CONCURRENT_SESSIONS} \
   ++actor_rollout_ref.rollout.custom.agent_framework.agent_runners.task.trajectory_selection=all \

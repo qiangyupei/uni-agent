@@ -52,6 +52,9 @@ def test_request_logging_preserves_transport_and_cleans_context(mode, caplog):
     assert f"event={event[mode]}" in caplog.text
     assert "event=request_end" in caplog.text
     assert "session=session-test" in caplog.text
+    assert "stage_elapsed_s=" in caplog.text
     assert "private-" not in caplog.text
     if mode == "complete":
         assert sent[-1]["body"] == b"private-response"
+        assert "event=response_headers_sending" in caplog.text
+        assert "event=response_first_body_sending" in caplog.text

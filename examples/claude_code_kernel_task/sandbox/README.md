@@ -12,7 +12,7 @@ image:
 Build the image referenced by the example task configuration:
 
 ```bash
-cd examples/triton_agent/sandbox
+cd examples/claude_code_kernel_task/sandbox
 OUTPUT_IMAGE=triton-claude-code-env:new bash build_image.sh
 ```
 

@@ -11,7 +11,7 @@ uni_agent/tasks/kernel_bench/
   preprocess.py              # DrKernel / NPUKernelBench preparation
   track_verify_snapshot.py   # best-prefix and early-stop hook
 
-examples/triton_agent/
+examples/claude_code_kernel_task/
   task_config_kernel_bench.yaml
   runner.py                  # per-session bindings and Claude output budget
   remote_docker.py, network.py
@@ -30,7 +30,7 @@ See [sandbox/README.md](sandbox/README.md) for image construction. The existing 
 Build the image on each remote Docker daemon:
 
 ```bash
-cd examples/triton_agent/sandbox
+cd examples/claude_code_kernel_task/sandbox
 DOCKER_HOST=ssh://root@npu-host-01 OUTPUT_IMAGE=triton-claude-code-env:new bash build_image.sh
 ```
 
@@ -85,7 +85,7 @@ Both produce `train.parquet`, `validation.parquet`, and `dataset_summary.json`. 
 
 ## 3. Start training
 
-Run from `examples/triton_agent` in the configured training environment:
+Run from `examples/claude_code_kernel_task` in the configured training environment:
 
 ```bash
 MODEL_PATH=/models/your-model \
@@ -121,6 +121,8 @@ The Claude hook records best-snapshot assistant indices and cooperatively stops 
 The postprocessor selects best-prefix trajectories at assistant boundaries. Multiple chains fall back to `all_final`, since a scalar assistant index cannot identify a Gateway chain. Missing implementations are filtered; retry is disabled by default. Token/mask/logprob alignment and framework reward fields are preserved.
 
 ## Logs
+
+For timeout analysis, `request_body_complete` and `request_validated` distinguish upload/parsing from generation. `previous_stage` and `stage_elapsed_s` show where time was spent; the 60-second waiting records measure time in the active stage without resetting it. The `response_headers_sending` and `response_first_body_sending` events precede the ASGI send call, so a missing matching completion event identifies a send that did not return successfully. Request validation logs protocol, streaming mode and budget; preparation logs the effective capped budget.
 
 Gateway timeout diagnostics use the `gateway_request` prefix in Gateway Ray worker logs and the collected main log. Each HTTP request has a unique `request` ID plus its `session` ID. Events cover preparation/lock wait, backend start/end, decoding, response headers/body completion, observed disconnects and errors. Every 60 seconds, `waiting` reports the active stage; `elapsed_s` is measured from receipt. Bodies and headers are not logged. Backend elapsed time includes routing, queueing and generation; the separately logged backend request ID is unchanged. Gateway currently waits for the full backend result before sending SSE. Logging does not add keepalives or change timeout/retry behavior. Disconnects are recorded only when ASGI observes them; response completion does not prove client receipt.
 

@@ -29,7 +29,7 @@ from uni_agent.gateway.adapters.openai import (
 )
 from uni_agent.gateway.adapters.types import AnthropicRequest, MalformedRequestError, OpenAIChatCompletionRequest
 from uni_agent.gateway.config import GatewayActorConfig
-from uni_agent.gateway.request_logging import RequestLoggingMiddleware
+from uni_agent.gateway.request_logging import RequestLoggingMiddleware, log_request_stage
 from uni_agent.gateway.session import (
     GatewaySession,
     MessageCodec,
@@ -174,6 +174,12 @@ class _GatewayActor:
         except MalformedRequestError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
+        log_request_stage(
+            "request_validated",
+            protocol="openai",
+            stream=payload.get("stream") is True,
+            max_tokens=internal["sampling_params"].get("max_tokens"),
+        )
         outcome = await session.run_generation(internal, self._backend)
         model = str(payload.get("model") or "unknown")
         if payload.get("stream") is True:
@@ -200,6 +206,12 @@ class _GatewayActor:
         except MalformedRequestError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
+        log_request_stage(
+            "request_validated",
+            protocol="anthropic",
+            stream=payload.get("stream") is True,
+            max_tokens=internal["sampling_params"].get("max_tokens"),
+        )
         outcome = await session.run_generation(internal, self._backend)
         model = str(payload.get("model") or "unknown")
         if payload.get("stream") is True:

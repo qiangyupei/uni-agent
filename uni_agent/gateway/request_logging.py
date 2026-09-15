@@ -16,14 +16,21 @@ def log_request_stage(stage: str, **fields) -> None:
     context = _request.get()
     if context is None:
         return
+    now = time.monotonic()
+    previous_stage = context["stage"]
+    stage_elapsed = now - context["stage_started"]
     if stage != "waiting":
         context["stage"] = stage
+        context["stage_started"] = now
     logger.info(
-        "gateway_request session=%s request=%s event=%s elapsed_s=%.3f details=%s",
+        "gateway_request session=%s request=%s event=%s elapsed_s=%.3f "
+        "previous_stage=%s stage_elapsed_s=%.3f details=%s",
         context["session"],
         context["id"],
         stage,
-        time.monotonic() - context["started"],
+        now - context["started"],
+        previous_stage,
+        stage_elapsed,
         fields,
     )
 
@@ -36,7 +43,14 @@ class RequestLoggingMiddleware:
         path = scope.get("path", "")
         if scope["type"] != "http" or not path.startswith("/sessions/"):
             return await self.app(scope, receive, send)
-        context = {"id": uuid4().hex, "session": path.split("/")[2], "started": time.monotonic(), "stage": "received"}
+        started = time.monotonic()
+        context = {
+            "id": uuid4().hex,
+            "session": path.split("/")[2],
+            "started": started,
+            "stage": "received",
+            "stage_started": started,
+        }
         token = _request.set(context)
         log_request_stage("received")
         status = None
@@ -52,10 +66,16 @@ class RequestLoggingMiddleware:
             message = await receive()
             if message["type"] == "http.disconnect":
                 log_request_stage("client_disconnected")
+            elif message["type"] == "http.request" and not message.get("more_body", False):
+                log_request_stage("request_body_complete")
             return message
 
         async def traced_send(message):
             nonlocal status, complete, first_body
+            if message["type"] == "http.response.start":
+                log_request_stage("response_headers_sending", status=message["status"])
+            elif message["type"] == "http.response.body" and first_body:
+                log_request_stage("response_first_body_sending")
             await send(message)
             if message["type"] == "http.response.start":
                 status = message["status"]

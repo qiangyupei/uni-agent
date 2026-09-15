@@ -2,8 +2,8 @@ import json
 
 import pytest
 
-from examples.kernel_agent.framework import KernelAgentFramework
-from examples.kernel_agent.trajectory_processor import process_trajectories
+from examples.claude_code_kernel_task.framework import KernelAgentFramework
+from examples.claude_code_kernel_task.trajectory_processor import process_trajectories
 from uni_agent.gateway.session import Trajectory
 from uni_agent.tasks import TaskResult
 
