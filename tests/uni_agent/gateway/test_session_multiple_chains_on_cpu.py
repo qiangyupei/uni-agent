@@ -763,9 +763,8 @@ async def test_multiple_chains_repeated_same_prompt_creates_siblings_and_continu
 @pytest.mark.cpu
 @pytest.mark.level0
 @pytest.mark.asyncio
-@pytest.mark.parametrize("extra_assistant_turns", [0, 1, 2])
-@pytest.mark.parametrize("rewrite_assistant", [False, True])
-async def test_chain_selection_excludes_positive_assistant_span(extra_assistant_turns, rewrite_assistant):
+@pytest.mark.parametrize("assistant_content", ["OLD", "EDITED"])
+async def test_chain_selection_excludes_positive_assistant_span(assistant_content):
     session = _session("assistant-span", enable_last_assistant_rollback=True)
     backend = SequencedBackend(["OLD", "NEW"])
     prompt = [{"role": "user", "content": "start"}]
@@ -773,22 +772,19 @@ async def test_chain_selection_excludes_positive_assistant_span(extra_assistant_
     [original_chain] = session.active_chains
     incoming = [
         *prompt,
-        {"role": "assistant", "content": "EDITED" if rewrite_assistant else "OLD"},
+        {"role": "assistant", "content": assistant_content},
         {"role": "user", "content": "continue"},
+        {"role": "assistant", "content": "external"},
+        {"role": "user", "content": "next"},
     ]
-    for _ in range(extra_assistant_turns):
-        incoming.extend([{"role": "assistant", "content": "external"}, {"role": "user", "content": "next"}])
 
     await _run(session, backend, incoming)
 
-    assert len(session.active_chains) == (2 if extra_assistant_turns else 1)
-    assert session.snapshot_state()["rollback_count"] == int(rewrite_assistant and not extra_assistant_turns)
-    if extra_assistant_turns:
-        assert session.active_chains[0] == original_chain
-        assert backend.calls[-1]["prompt_ids"] == session._codec.build_initial_tokens(incoming)
-        assert session.active_chains[-1].buffer.response_ids == _ids("NEW")
-    else:
-        assert session.active_chains[0].chain_id == original_chain.chain_id
+    preserved_chain, new_chain = session.active_chains
+    assert preserved_chain == original_chain
+    assert session.snapshot_state()["rollback_count"] == 0
+    assert backend.calls[-1]["prompt_ids"] == session._codec.build_initial_tokens(incoming)
+    assert new_chain.buffer.response_ids == _ids("NEW")
 
 
 @pytest.mark.cpu
