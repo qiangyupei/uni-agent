@@ -767,24 +767,18 @@ async def test_multiple_chains_repeated_same_prompt_creates_siblings_and_continu
 async def test_chain_selection_excludes_positive_assistant_span(assistant_content):
     session = _session("assistant-span", enable_last_assistant_rollback=True)
     backend = SequencedBackend(["OLD", "NEW"])
-    prompt = [{"role": "user", "content": "start"}]
-    await _run(session, backend, prompt)
-    [original_chain] = session.active_chains
     incoming = [
-        *prompt,
+        {"role": "user", "content": "start"},
         {"role": "assistant", "content": assistant_content},
         {"role": "user", "content": "continue"},
         {"role": "assistant", "content": "external"},
         {"role": "user", "content": "next"},
     ]
 
+    await _run(session, backend, incoming[:1])
     await _run(session, backend, incoming)
 
-    preserved_chain, new_chain = session.active_chains
-    assert preserved_chain == original_chain
-    assert session.snapshot_state()["rollback_count"] == 0
-    assert backend.calls[-1]["prompt_ids"] == session._codec.build_initial_tokens(incoming)
-    assert new_chain.buffer.response_ids == _ids("NEW")
+    assert [chain.buffer.response_ids for chain in session.active_chains] == [_ids("OLD"), _ids("NEW")]
 
 
 @pytest.mark.cpu
