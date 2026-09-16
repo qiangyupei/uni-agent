@@ -419,6 +419,7 @@ class GatewaySession:
         mm_processor_kwargs = self._codec.mm_processor_kwargs or {}
         incoming_message_prefix_hashes = self._extend_message_prefix_hashes([], messages)
         selection = self._select_chain(
+            messages=messages,
             tools=tools,
             incoming_message_prefix_hashes=incoming_message_prefix_hashes,
         )
@@ -576,26 +577,25 @@ class GatewaySession:
     def _select_chain(
         self,
         *,
+        messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None,
         incoming_message_prefix_hashes: list[str],
     ) -> tuple[ChainState, bool] | None:
         ranked_candidates = []
         deepest_rollback_candidates = []
         deepest_rollback_service_value = -1
-        has_fresh_boundary = False
         for chain in self.active_chains:
             if chain.chain_id in self.reserved_chain_ids or chain.active_tool_schemas != tools:
                 continue
             assistant_start = chain.last_assistant_start
             assistant_start_len = assistant_start.message_history_len
-            if assistant_start_len > len(incoming_message_prefix_hashes):
+            # A request ending exactly at the boundary is a fresh sample from
+            # the same prompt, not a rewrite of the abandoned assistant.
+            if assistant_start_len >= len(incoming_message_prefix_hashes):
                 continue
             if incoming_message_prefix_hashes[assistant_start_len - 1] != assistant_start.tip_hash:
                 continue
-            # The same input boundary requests a fresh sibling, not a rollback
-            # of a shallower chain. Exact-prefix reuse remains valid.
-            if assistant_start_len == len(incoming_message_prefix_hashes):
-                has_fresh_boundary = True
+            if sum(message["role"] == "assistant" for message in messages[assistant_start_len:]) > 1:
                 continue
             if self._is_chain_prefix_hash_match(
                 chain=chain,
@@ -610,8 +610,6 @@ class GatewaySession:
                 elif assistant_start_len == deepest_rollback_service_value:
                     deepest_rollback_candidates.append(chain)
 
-        if has_fresh_boundary:
-            deepest_rollback_candidates.clear()
         if len(deepest_rollback_candidates) == 1:
             rollback_chain = deepest_rollback_candidates[0]
             ranked_candidates.append((rollback_chain, deepest_rollback_service_value, False))
