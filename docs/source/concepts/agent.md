@@ -109,7 +109,7 @@ Use this style when an existing Agent Harness already owns its loop and Tools.
 
 ### Claude Code Prompt Handling
 
-The Claude Code Agent requires exactly one non-empty text user message and allows at most one system message. A second message of either role raises an error before the Agent executes sandbox commands, even if its content is empty. The user text is passed to `claude -p`; non-empty system text is passed to `--system-prompt`, replacing Claude Code's default system prompt. Accepted text is preserved without trimming. Missing, null, empty, or whitespace-only system content adds no system-prompt flag, retaining the default prompt unless `extra_args` explicitly overrides it. Non-text content is rejected for both roles.
+The Claude Code Agent requires exactly one user message and allows at most one system message; a second message of either role raises an error. User content must be non-blank text. System content must be text, null, or omitted. The user text is passed to `claude -p`; non-blank system text is passed to `--system-prompt`, replacing Claude Code's default system prompt. Missing, null, empty, or whitespace-only system content adds no system-prompt flag, retaining the default prompt unless `extra_args` explicitly overrides it. A non-blank system message conflicts with `--system-prompt` or `--system-prompt-file` in `extra_args`; append flags remain explicitly controlled through `extra_args`.
 
 System messages can come from the dataset prompt or the existing Task `prompt_template`:
 
@@ -123,7 +123,7 @@ agent:
   name: claude_code
 ```
 
-Template placeholders use Task metadata. A configured template replaces the input prompt, so a user-only template does not inherit dataset system messages. Non-empty system messages conflict with `--system-prompt` or `--system-prompt-file` in `extra_args`; append flags remain explicitly controlled through `extra_args`.
+Template placeholders use Task metadata. A configured template replaces the input prompt, so a user-only template does not inherit dataset system messages.
 
 ## Custom Agent
 
