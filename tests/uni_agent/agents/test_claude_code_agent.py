@@ -137,8 +137,7 @@ def test_ensure_claude_requires_binary_on_path_after_install():
         ([None], ""),
         ([""], ""),
         ([" \n"], ""),
-        (["Follow the task rules."], "Follow the task rules."),
-        (["First", "Second"], "First\n\nSecond"),
+        (["  Follow the task rules.\n"], "  Follow the task rules.\n"),
     ],
 )
 def test_run_forwards_workdir(system_contents, expected_system_prompt):
@@ -248,31 +247,20 @@ def test_run_rejects_invalid_system_prompt(content, extra_args, error):
 
 @pytest.mark.cpu
 @pytest.mark.level0
-def test_run_joins_user_messages_in_order_without_rewriting():
+@pytest.mark.parametrize("role", ["user", "system"])
+@pytest.mark.parametrize("first_content", ["First", None])
+def test_run_rejects_duplicate_prompt_roles(role, first_content):
     config = ClaudeCodeConfig(
         model=ModelConfig(base_url="http://gateway:8000/v1", model_name="policy"),
     )
-    sandbox = _FakeSandbox(probe_results=[0])
+    sandbox = _FakeSandbox(probe_results=[])
+    messages = [{"role": role, "content": first_content}, {"role": role, "content": "Second"}]
+    if role == "system":
+        messages.insert(1, {"role": "user", "content": "Fix the bug"})
 
-    asyncio.run(
-        ClaudeCodeAgent(config).run(
-            sandbox=sandbox,
-            messages=[
-                {"role": "user", "content": "  Inspect the repository.\n"},
-                {"role": "system", "content": "Follow the task rules."},
-                {"role": "user"},
-                {"role": "user", "content": None},
-                {"role": "user", "content": ""},
-                {"role": "user", "content": " \n"},
-                {"role": "user", "content": "Fix the bug.\nRun the tests.  "},
-                {"role": "system", "content": "Report the result."},
-            ],
-        )
-    )
-
-    argv = sandbox.exec_calls[0]["argv"]
-    assert argv[:3] == ["claude", "-p", "  Inspect the repository.\n\n\nFix the bug.\nRun the tests.  "]
-    assert argv[argv.index("--system-prompt") + 1] == "Follow the task rules.\n\nReport the result."
+    with pytest.raises(ValueError, match=f"at most one '{role}' message"):
+        asyncio.run(ClaudeCodeAgent(config).run(sandbox=sandbox, messages=messages))
+    assert not sandbox.calls and not sandbox.exec_calls
 
 
 @pytest.mark.cpu
@@ -281,15 +269,9 @@ def test_run_joins_user_messages_in_order_without_rewriting():
     "user_messages,error",
     [
         ([], "non-empty user prompt"),
-        (
-            [{"role": "user"}, *[{"role": "user", "content": content} for content in (None, "", " \n")]],
-            "non-empty user prompt",
-        ),
+        ([{"role": "user"}], "non-empty user prompt"),
+        ([{"role": "user", "content": " \n"}], "non-empty user prompt"),
         ([{"role": "user", "content": []}], "text user messages"),
-        (
-            [{"role": "user", "content": "Fix the bug"}, {"role": "user", "content": 123}],
-            "text user messages",
-        ),
     ],
 )
 def test_run_rejects_invalid_user_prompt(user_messages, error):

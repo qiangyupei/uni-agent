@@ -104,29 +104,22 @@ class ClaudeCodeAgent(Agent):
         base_url = cfg.model.base_url
         if not base_url:
             raise ValueError("claude_code: config.model.base_url is not set (the gateway/vLLM policy endpoint)")
-        user_parts = []
+        prompts = {}
         for message in messages:
-            if message.get("role") != "user" or message.get("content") is None:
+            role = message.get("role")
+            if role not in {"user", "system"}:
                 continue
-            content = message["content"]
-            if not isinstance(content, str):
-                raise ValueError("claude_code requires text user messages")
-            if content.strip():
-                user_parts.append(content)
-        user_prompt = "\n\n".join(user_parts)
+            if role in prompts:
+                raise ValueError(f"claude_code allows at most one '{role}' message")
+            content = message.get("content")
+            if content is not None and not isinstance(content, str):
+                raise ValueError(f"claude_code requires text {role} messages")
+            prompts[role] = content if content and content.strip() else ""
+
+        user_prompt = prompts.get("user", "")
         if not user_prompt:
             raise ValueError("claude_code requires a non-empty user prompt")
-
-        system_parts = []
-        for message in messages:
-            if message.get("role") != "system" or message.get("content") is None:
-                continue
-            content = message["content"]
-            if not isinstance(content, str):
-                raise ValueError("claude_code requires text system messages")
-            if content.strip():
-                system_parts.append(content)
-        system_prompt = "\n\n".join(system_parts)
+        system_prompt = prompts.get("system", "")
         if system_prompt and any(
             arg.split("=", 1)[0] in {"--system-prompt", "--system-prompt-file"} for arg in cfg.extra_args
         ):

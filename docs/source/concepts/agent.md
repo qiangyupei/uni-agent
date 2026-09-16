@@ -109,7 +109,7 @@ Use this style when an existing Agent Harness already owns its loop and Tools.
 
 ### Claude Code Prompt Handling
 
-The Claude Code Agent joins non-empty text user and system messages separately, preserving their order within each role and inserting a blank line between messages. It passes the combined user messages to `claude -p` and the combined system messages to `--system-prompt`. For both roles, missing, null, empty, or whitespace-only content is skipped; non-text content is rejected, and accepted text is preserved without trimming. At least one non-empty user message is required. When no non-empty system content remains, no system-prompt flag is added, retaining Claude Code's default prompt unless `extra_args` explicitly overrides it.
+The Claude Code Agent requires exactly one non-empty text user message and allows at most one system message. A second message of either role raises an error before the Agent executes sandbox commands, even if its content is empty. The user text is passed to `claude -p`; non-empty system text is passed to `--system-prompt`, replacing Claude Code's default system prompt. Accepted text is preserved without trimming. Missing, null, empty, or whitespace-only system content adds no system-prompt flag, retaining the default prompt unless `extra_args` explicitly overrides it. Non-text content is rejected for both roles.
 
 System messages can come from the dataset prompt or the existing Task `prompt_template`:
 
