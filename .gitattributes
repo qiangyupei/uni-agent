@@ -1,0 +1,4 @@
+*.sh text eol=lf
+examples/claude_code_kernel_task/sandbox/tools/*.py text eol=lf
+examples/claude_code_kernel_task/sandbox/tools/verifier/*.py text eol=lf
+examples/claude_code_kernel_task/sandbox/Dockerfile text eol=lf

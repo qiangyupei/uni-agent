@@ -129,3 +129,9 @@ logs
 log
 outputs
 .history
+
+# Local KernelBench PR drafts, tests and sandbox image construction assets
+/recipe-pr.md
+/examples/claude_code_kernel_task/ROLLOUT_FIXES.md
+/examples/claude_code_kernel_task/tests/
+/examples/claude_code_kernel_task/sandbox/
