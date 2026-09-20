@@ -18,14 +18,14 @@ examples/claude_code_kernel_task/
   remote_docker.py           # Docker provider, host selection and NPU settings
   trajectory_processor.py    # trajectory postprocessor
   run_train_gpu.sh           # GPU training, remote NPU verification
-  sandbox/                   # image template, skills and verifier tools
+  sandbox/                   # image template, pinned upstream assets and RL patch
 ```
 
 The Task is registered as `npu_triton_kernel`. The runner delegates to the stock `run_task`; the Task uses `uni_agent.agents.claude_code`.
 
 ## 1. Prepare the sandbox hosts
 
-The `sandbox/` directory contains the image build files, skills and verifier tools. The base image must already contain Claude Code, Python, Ascend/CANN, torch-npu, Triton Ascend, sudo and the `claude` user. See [sandbox setup](sandbox/README.md); the image must match `task_config_kernel_bench.yaml`.
+The `sandbox/` directory contains image build files and local RL adaptations. `build_image.sh` assembles skills and verifier scripts from a pinned upstream commit plus a local patch; it also accepts a local upstream repository for offline builds. The base image must already contain Claude Code, Python, Ascend/CANN, torch-npu, Triton Ascend, sudo and the `claude` user. See [sandbox setup](sandbox/README.md); the image must match `task_config_kernel_bench.yaml`.
 
 Build the image on each remote Docker daemon:
 
