@@ -31,10 +31,12 @@ Build the image on each remote Docker daemon:
 
 ```bash
 cd examples/claude_code_kernel_task/sandbox
-DOCKER_HOST=ssh://root@npu-host-01 OUTPUT_IMAGE=triton-claude-code-env:latest bash build_image.sh
+DOCKER_HOST=ssh://root@npu-host-01 \
+BASE_IMAGE='<your-prepared-ascend-claude-image>:<tag>' \
+bash build_image.sh
 ```
 
-Use the same image name in `task_config_kernel_bench.yaml`. Check all device/driver bind-mount sources in that file against each host.
+Replace the placeholder with your prepared base image. The output defaults to `triton-claude-code-env:latest`, matching `task_config_kernel_bench.yaml`; if overriding `OUTPUT_IMAGE`, update the YAML too. Check all device/driver bind-mount sources in that file against each host.
 
 ### External sources
 
