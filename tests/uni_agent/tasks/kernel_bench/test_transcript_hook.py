@@ -8,7 +8,6 @@ import pytest
 
 from uni_agent.tasks.kernel_bench.track_verify_snapshot import post, pre
 
-
 pytestmark = [pytest.mark.cpu, pytest.mark.level0]
 
 

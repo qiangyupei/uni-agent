@@ -113,7 +113,8 @@ def _read_file(root_fd: int, relative: str, limit: int) -> dict[str, Any]:
 def _fingerprints(files: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
     return {
         path: {key: value for key, value in item.items() if key != "data"}
-        for path, item in files.items() if path not in STATE_PATHS
+        for path, item in files.items()
+        if path not in STATE_PATHS
     }
 
 
@@ -141,8 +142,12 @@ def collect(workspace: str, op_name: str, kind: str) -> dict[str, Any]:
                 # A missing/unreadable/changing control-state file must not change reward.
                 files[path] = {"status": "unreadable"}
     return {
-        "version": 1, "workspace": workspace, "op_name": op_name, "kind": kind,
-        "directories": directories, "files": files,
+        "version": 1,
+        "workspace": workspace,
+        "op_name": op_name,
+        "kind": kind,
+        "directories": directories,
+        "files": files,
     }
 
 
@@ -158,7 +163,10 @@ class WorkspaceSnapshot:
     ) -> None:
         limits = file_limits(op_name, kind)
         if (payload.get("version"), payload.get("workspace"), payload.get("op_name"), payload.get("kind")) != (
-            1, workspace, op_name, kind,
+            1,
+            workspace,
+            op_name,
+            kind,
         ):
             raise ValueError("snapshot identity/version mismatch")
         self.files = payload.get("files")
@@ -251,7 +259,8 @@ def recover(request: dict[str, Any]) -> dict[str, Any]:
         raise RuntimeError("staged implementation changed before recovery")
     best_path = f"src/{op_name}_triton_ascend_impl_best.py"
     metrics = {
-        **request["metrics"], "implementation_path": best_path,
+        **request["metrics"],
+        "implementation_path": best_path,
         "implementation_sha256": request["staged_digest"],
     }
     raw_metrics = (json.dumps(metrics, ensure_ascii=False, allow_nan=False, separators=(",", ":")) + "\n").encode()
@@ -270,7 +279,9 @@ def main() -> None:
         result = recover(request)
     else:
         result = collect(
-            request["workspace"], request["op_name"], request["kind"],
+            request["workspace"],
+            request["op_name"],
+            request["kind"],
         )
     print(json.dumps(result, separators=(",", ":"), allow_nan=False), flush=True)
 

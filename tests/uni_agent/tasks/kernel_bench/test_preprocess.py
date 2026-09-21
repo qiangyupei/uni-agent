@@ -78,16 +78,11 @@ def test_seeded_max_rows_never_changes_record_uid() -> None:
         SourceRecord(str(index), f"CODE={index}\n", {"cases.json": "{}\n"}, f"fingerprint-{index}")
         for index in range(5)
     ]
-    full_uids = {
-        record.source_id: stable_uid(record, dataset_name="bench") for record in records
-    }
+    full_uids = {record.source_id: stable_uid(record, dataset_name="bench") for record in records}
     chosen = select_records(records, seed=7, max_rows=3)
 
     assert [record.source_id for record in chosen] == ["4", "0", "3"]
-    assert all(
-        stable_uid(record, dataset_name="bench") == full_uids[record.source_id]
-        for record in chosen
-    )
+    assert all(stable_uid(record, dataset_name="bench") == full_uids[record.source_id] for record in chosen)
 
 
 def test_drkernel_loader_deduplicates_and_namespaces_cross_level_ids(

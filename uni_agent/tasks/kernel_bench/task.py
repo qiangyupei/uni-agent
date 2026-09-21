@@ -161,7 +161,11 @@ class TritonOperatorTask(Task):
                 evaluate_started = time.monotonic()
                 evaluation = await asyncio.wait_for(
                     self._evaluate_workspace(
-                        sandbox, cfg, workspace, op_name, initial_impl_digests=initial_impl_digests,
+                        sandbox,
+                        cfg,
+                        workspace,
+                        op_name,
+                        initial_impl_digests=initial_impl_digests,
                     ),
                     timeout=cfg.evaluation_timeout,
                 )
@@ -345,10 +349,19 @@ class TritonOperatorTask(Task):
     ) -> dict[str, Any]:
         """One snapshot RPC; only staged-best recovery needs a second RPC."""
         snapshot = await _fetch_workspace_snapshot(
-            sandbox, workspace, op_name, kind="evaluate", timeout=cfg.evaluation_timeout,
+            sandbox,
+            workspace,
+            op_name,
+            kind="evaluate",
+            timeout=cfg.evaluation_timeout,
         )
         evaluation = await self._evaluate_snapshot(
-            sandbox, cfg, workspace, op_name, snapshot, initial_impl_digests=initial_impl_digests,
+            sandbox,
+            cfg,
+            workspace,
+            op_name,
+            snapshot,
+            initial_impl_digests=initial_impl_digests,
         )
         evaluation["_verify_state"] = {
             "stop": snapshot.read_json(_EARLY_STOP_PATH),
@@ -454,14 +467,8 @@ class TritonOperatorTask(Task):
 
         # Legacy priority 2: recover the latest verified staged implementation
         # and metrics from the verifier artifacts left by verify_once.sh.
-        summary = (
-            snapshot.read_json("output/verify/verify_result_summary.json")
-            if artifact_dirs_safe
-            else None
-        )
-        verify = (
-            snapshot.read_json("output/verify/verify_result.json") if artifact_dirs_safe else None
-        )
+        summary = snapshot.read_json("output/verify/verify_result_summary.json") if artifact_dirs_safe else None
+        verify = snapshot.read_json("output/verify/verify_result.json") if artifact_dirs_safe else None
         perf = snapshot.read_json("output/verify/perf_result.json") if artifact_dirs_safe else None
         artifact_metrics = _metrics_from_agent_verify_artifacts(
             op_name=op_name,
@@ -476,7 +483,8 @@ class TritonOperatorTask(Task):
         )
         staged_mtime = snapshot.mtime(staged_impl_path)
         artifact_mtimes = [
-            snapshot.mtime(path) for path in (
+            snapshot.mtime(path)
+            for path in (
                 "output/verify/verify_result_summary.json",
                 "output/verify/verify_result.json",
                 "output/verify/perf_result.json",
@@ -486,8 +494,14 @@ class TritonOperatorTask(Task):
         artifacts_not_older = staged_mtime is not None and bool(valid_mtimes) and staged_mtime <= max(valid_mtimes)
         if artifact_metrics is not None and staged_digest and artifact_binding is not None and artifacts_not_older:
             recovered_snapshot = await _fetch_workspace_snapshot(
-                sandbox, workspace, op_name, kind="recover", timeout=cfg.evaluation_timeout,
-                expected_files=snapshot.fingerprints(), staged_digest=staged_digest, metrics=artifact_metrics,
+                sandbox,
+                workspace,
+                op_name,
+                kind="recover",
+                timeout=cfg.evaluation_timeout,
+                expected_files=snapshot.fingerprints(),
+                staged_digest=staged_digest,
+                metrics=artifact_metrics,
             )
             recovered = (
                 recovered_snapshot.digest(best_impl_path) == staged_digest
@@ -566,7 +580,6 @@ class TritonOperatorTask(Task):
             "selected_metrics_source": "missing_metrics",
             "used_best_metrics": False,
         }
-
 
     async def _collect_artifacts(
         self,
@@ -1023,7 +1036,10 @@ async def _implementation_digests(sandbox: Sandbox, workspace: str, op_name: str
 
 
 def _snapshot_implementation_status(
-    snapshot: WorkspaceSnapshot, path: str, *, baseline_digest: str | None,
+    snapshot: WorkspaceSnapshot,
+    path: str,
+    *,
+    baseline_digest: str | None,
 ) -> dict[str, Any]:
     raw = snapshot.read_bytes(path)
     digest = snapshot.digest(path)

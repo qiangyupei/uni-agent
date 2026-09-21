@@ -4,8 +4,8 @@ import pytest
 
 from uni_agent.tasks.kernel_bench.reward import attach_reward, normalize_metrics
 
-
 pytestmark = [pytest.mark.cpu, pytest.mark.level0]
+
 
 def test_partial_correctness_and_speedup_reward() -> None:
     metrics = normalize_metrics(

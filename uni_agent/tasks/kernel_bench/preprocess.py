@@ -23,9 +23,12 @@ Correctness is required before latency optimization. Finish with the best fully
 verified implementation in place.
 """
 
-# 66_Matmul_Dropout_Softmax was excluded because stochastic dropout prevents reliable element-wise comparison with the baseline.
-# 80_Gemm_Max_Subtract_GELU and 83_Conv3d_GroupNorm_Min_Clamp_Dropout were excluded because their reference implementations degenerate into all-zero outputs.
-# 92_cumsum_exclusive was excluded because its reference slices the wrong dimension, resulting in incorrect output shape and semantics.
+# 66_Matmul_Dropout_Softmax was excluded because stochastic dropout prevents
+# reliable element-wise comparison with the baseline.
+# 80_Gemm_Max_Subtract_GELU and 83_Conv3d_GroupNorm_Min_Clamp_Dropout were excluded
+# because their reference implementations degenerate into all-zero outputs.
+# 92_cumsum_exclusive was excluded because its reference slices the wrong dimension,
+# resulting in incorrect output shape and semantics.
 _DRKERNEL_INVALID_VALIDATION_REFERENCES = {
     "66matmuldropoutsoftmax",
     "80gemmmaxsubtractgelu",
@@ -148,9 +151,7 @@ def _render_record(
 ) -> tuple[str, str, list[dict[str, str]], list[dict[str, str]], str]:
     """Render every UID-relevant task field without depending on the UID itself."""
 
-    operator_seed = hashlib.sha256(
-        f"{record.source_id}\0{record.fingerprint}".encode()
-    ).hexdigest()[:12]
+    operator_seed = hashlib.sha256(f"{record.source_id}\0{record.fingerprint}".encode()).hexdigest()[:12]
     op_name = _safe_operator_name(record.source_id, operator_seed)
     support_files = [{"name": f"{op_name}.json", "content": "{}\n"}]
     task_code = record.code

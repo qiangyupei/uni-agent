@@ -194,8 +194,7 @@ class FakeSandbox:
             "kind": kind,
             "files": files,
             "directories": {
-                relative: ("/workspace" if relative == "." else f"/workspace/{relative}")
-                not in self.unsafe_directories
+                relative: ("/workspace" if relative == "." else f"/workspace/{relative}") not in self.unsafe_directories
                 for relative in (".", "src", "output", "output/verify")
             },
         }
