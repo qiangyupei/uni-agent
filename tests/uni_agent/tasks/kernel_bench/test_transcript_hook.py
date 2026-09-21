@@ -54,30 +54,10 @@ def test_hook_annotates_only_a_changed_best_pair(tmp_path: Path) -> None:
     assert len(annotated["assistant_snapshot_impl_sha256"]) == 64
 
 
-def test_hook_does_not_relabel_unchanged_snapshot(tmp_path: Path) -> None:
-    write_json(tmp_path / "TASK_METADATA.json", {"op_name": "smoke"})
-    transcript = tmp_path / "transcript.jsonl"
-    transcript.write_text(
-        json.dumps({"type": "assistant", "message": {"id": "a1", "content": []}}) + "\n",
-        encoding="utf-8",
-    )
-    best_metrics = tmp_path / "metrics_best.json"
-    best_impl = tmp_path / "src/smoke_triton_ascend_impl_best.py"
-    write_json(best_metrics, {"correctness_ok": True})
-    best_impl.parent.mkdir(parents=True)
-    best_impl.write_text("# unchanged\n", encoding="utf-8")
-    payload = hook_payload(tmp_path, transcript)
-
-    pre(payload)
-    post(payload)
-
-    assert "assistant_index" not in json.loads(best_metrics.read_text(encoding="utf-8"))
-
-
-@pytest.mark.parametrize("change_metrics", [False, True])
-def test_hook_does_not_relabel_when_only_half_the_pair_changes(
+@pytest.mark.parametrize("change", ["neither", "metrics", "implementation"])
+def test_hook_does_not_relabel_without_both_changes(
     tmp_path: Path,
-    change_metrics: bool,
+    change: str,
 ) -> None:
     write_json(tmp_path / "TASK_METADATA.json", {"op_name": "smoke"})
     transcript = tmp_path / "transcript.jsonl"
@@ -93,9 +73,9 @@ def test_hook_does_not_relabel_when_only_half_the_pair_changes(
     payload = hook_payload(tmp_path, transcript)
 
     pre(payload)
-    if change_metrics:
+    if change == "metrics":
         write_json(best_metrics, {"speedup": 1.1})
-    else:
+    elif change == "implementation":
         best_impl.write_text("# new\n", encoding="utf-8")
     post(payload)
 

@@ -402,30 +402,8 @@ def test_full_correctness_artifacts_reuse_valid_performance() -> None:
     assert evaluation["metrics"]["reward_components"]["raw_speedup"] == 1.0
 
 
-def test_verifier_artifact_digest_mismatch_is_not_recovered() -> None:
-    sandbox = FakeSandbox(has_impl=False)
-    sandbox.files.update(
-        {
-            "/workspace/output/verify/smoke_triton_ascend_impl.py": _STAGED_IMPL,
-            "/workspace/output/verify/verify_result.json": _json_bytes(
-                {
-                    "total_cases": 2,
-                    "passed_cases": 2,
-                    "failed_cases": 0,
-                    "compile_ok": True,
-                    "verified_impl_sha256": "0" * 64,
-                }
-            ),
-        }
-    )
-
-    evaluation = _evaluate(sandbox)
-
-    assert evaluation["selected_metrics_source"] == "not_run_missing_impl"
-    assert "/workspace/src/smoke_triton_ascend_impl_best.py" not in sandbox.files
-
-
-def test_conflicting_verify_and_perf_digests_are_not_recovered() -> None:
+@pytest.mark.parametrize("conflicting_perf", [False, True])
+def test_mismatched_artifact_digests_are_not_recovered(conflicting_perf: bool) -> None:
     digest = hashlib.sha256(_STAGED_IMPL).hexdigest()
     sandbox = FakeSandbox(has_impl=False)
     sandbox.files.update(
@@ -437,14 +415,16 @@ def test_conflicting_verify_and_perf_digests_are_not_recovered() -> None:
                     "passed_cases": 2,
                     "failed_cases": 0,
                     "compile_ok": True,
-                    "verified_impl_sha256": digest,
+                    "verified_impl_sha256": digest if conflicting_perf else "0" * 64,
                 }
-            ),
-            "/workspace/output/verify/perf_result.json": _json_bytes(
-                {"speedup_vs_torch": 1.0, "verified_impl_sha256": "0" * 64}
             ),
         }
     )
+
+    if conflicting_perf:
+        sandbox.files["/workspace/output/verify/perf_result.json"] = _json_bytes(
+            {"speedup_vs_torch": 1.0, "verified_impl_sha256": "0" * 64}
+        )
 
     evaluation = _evaluate(sandbox)
 
@@ -778,6 +758,7 @@ def test_agent_verify_entrypoint_must_resolve_to_trusted_command() -> None:
 
 
 @pytest.mark.parametrize("source,expected_calls", [("best", 1), ("staged", 2)])
+@pytest.mark.skipif(sys.platform == "win32", reason="The sandbox collector requires POSIX paths and file APIs")
 def test_workspace_snapshot_executes_real_collector(tmp_path: Path, source: str, expected_calls: int) -> None:
     """Exercise the collector/recovery protocol without Docker or accelerator work."""
     (tmp_path / "src").mkdir()
