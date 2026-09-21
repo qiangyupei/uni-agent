@@ -207,6 +207,13 @@ class _GatewayActor:
                 allowed_sampling_keys=self._allowed_request_sampling_param_keys,
             )
             _validate_sampling_params(internal["sampling_params"])
+            requested_max_tokens = internal["sampling_params"].get("max_tokens", 0)
+            if requested_max_tokens > 8192:
+                logger.warning(
+                    "Anthropic request exceeds 8192 output tokens: session_id=%s requested_max_tokens=%s",
+                    session_id,
+                    requested_max_tokens,
+                )
             discarded_keys = (
                 session.sampling_params.keys()
                 & payload.keys()
