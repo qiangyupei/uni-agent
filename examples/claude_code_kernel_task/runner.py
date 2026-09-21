@@ -32,7 +32,6 @@ async def run_triton_task(
     evaluator_npu_device_ids: str,
     evaluator_npu_lock_dir: str = "/var/lock/triton-agent-npu",
     evaluator_npu_lock_timeout: float = 1200.0,
-    max_response_length: int | None = None,
     validation_max_turns: int = 120,
     validation_run_timeout: float = 10800,
     **kwargs: Any,
@@ -53,9 +52,6 @@ async def run_triton_task(
         raise ValueError("run_triton_task requires tools_kwargs['task']")
     if task_config.get("metadata", {}).get("split") == "validation":
         task_config.setdefault("agent", {}).update(max_turns=validation_max_turns, run_timeout=validation_run_timeout)
-    if max_response_length is not None:
-        extra_env = task_config.setdefault("agent", {}).setdefault("extra_env", {})
-        extra_env["CLAUDE_CODE_MAX_OUTPUT_TOKENS"] = str(max_response_length)
     metadata = task_config.setdefault("metadata", {})
     if not isinstance(metadata, dict):
         raise TypeError("tools_kwargs['task']['metadata'] must be a mapping")

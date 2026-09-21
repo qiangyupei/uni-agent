@@ -5,13 +5,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="${REPO_ROOT:-$(cd "${SCRIPT_DIR}/../.." && pwd)}"
 cd "${REPO_ROOT}"
 
-# NVIDIA/Megatron variant of this recipe. It preserves the synchronous trainer
-# topology of the legacy GPU launcher while using stock verl and UniAgent APIs.
-# Keep NCCL/NIC/CUDA settings in the Ray runtime environment so every worker
-# receives the same values.
 RECIPE_DIR="examples/claude_code_kernel_task"
 NNODES=${NNODES:-2}
-NGPUS_PER_NODE=${NGPUS_PER_NODE:-${N_GPUS:-8}}
+NGPUS_PER_NODE=${NGPUS_PER_NODE:-8}
 
 project_name=${PROJECT_NAME:-"Triton-Agent-sync"}
 exp_name=${EXP_NAME:-"$(date +%Y%m%d%H%M)_exp"}
@@ -48,9 +44,9 @@ EVALUATOR_NPU_LOCK_TIMEOUT=${EVALUATOR_NPU_LOCK_TIMEOUT:-1200}
 IFS=',' read -r -a evaluator_devices <<< "${EVALUATOR_NPU_DEVICE_IDS}"
 IFS=',' read -r -a remote_docker_hosts <<< "${REMOTE_DOCKER_HOSTS}"
 MAX_CONCURRENT_SESSIONS=${MAX_CONCURRENT_SESSIONS:-$((${#evaluator_devices[@]} * ${#remote_docker_hosts[@]} * 4))}
+
 # Algorithm and sequence lengths.
 loss_agg_mode=${LOSS_AGG_MODE:-token-mean}
-
 max_prompt_length=${MAX_PROMPT_LENGTH:-184320}
 max_response_length=${MAX_RESPONSE_LENGTH:-8192}
 max_model_len=${MAX_MODEL_LEN:-$((max_prompt_length + max_response_length))}
@@ -70,8 +66,8 @@ train_etp=${ETP:-1}
 actor_ppo_max_token_len=${PPO_MAX_TOKEN_LEN_PER_GPU:-28672}
 infer_ppo_max_token_len=${LOG_PROB_MAX_TOKEN_LEN_PER_GPU:-${actor_ppo_max_token_len}}
 seed=${VERL_DETERMINISTIC_SEED:-1234}
-routing_replay_mode=${ROUTING_REPLAY_MODE:-disabled}
-enable_rollout_routing_replay=${ENABLE_ROLLOUT_ROUTING_REPLAY:-False}
+routing_replay_mode=${ROUTING_REPLAY_MODE:-R3}
+enable_rollout_routing_replay=${ENABLE_ROLLOUT_ROUTING_REPLAY:-True}
 
 train_prompt_bsz=${BATCH_SIZE:-16}
 val_prompt_bsz=${VAL_BATCH_SIZE:-128}
@@ -82,7 +78,7 @@ actor_lr=${ACTOR_LR:-1e-6}
 test_freq=${TEST_FREQ:-10}
 save_freq=${SAVE_FREQ:-10}
 total_epochs=${TOTAL_EPOCHS:-100}
-val_before_train=${VAL_BEFORE_TRAIN:-False}
+val_before_train=${VAL_BEFORE_TRAIN:-True}
 gpu_memory_utilization=${ROLLOUT_GPU_MEM_UTIL:-0.72}
 rollout_max_num_seqs=${ROLLOUT_MAX_NUM_SEQS:-60}
 rollout_max_num_batched_tokens=${ROLLOUT_MAX_NUM_BATCHED_TOKENS:-65536}
@@ -109,7 +105,6 @@ MAIN_CMD=(
   data.val_batch_size=${val_prompt_bsz}
   data.return_raw_chat=True
   actor_rollout_ref.rollout.n=${n_resp_per_prompt}
-  actor_rollout_ref.actor.policy_loss.loss_mode=vanilla
   algorithm.adv_estimator=grpo
   algorithm.use_kl_in_reward=False
   algorithm.kl_ctrl.kl_coef=0.001
@@ -168,7 +163,6 @@ MAIN_CMD=(
   ++actor_rollout_ref.rollout.agent.agent_loop_manager_class=uni_agent.framework.entry.AgentFrameworkRolloutAdapter
   ++actor_rollout_ref.rollout.custom.agent_framework.gateway_count=${GATEWAY_COUNT}
   "++actor_rollout_ref.rollout.custom.agent_framework.log_dir=${AGENT_LOG_DIR}"
-  ++actor_rollout_ref.rollout.custom.agent_framework.use_reward_loop_worker=False
   ++actor_rollout_ref.rollout.custom.agent_framework.trajectory_postprocessor_fqn=examples.claude_code_kernel_task.trajectory_processor.process_trajectories
   ++actor_rollout_ref.rollout.custom.agent_framework.trajectory_postprocessor_kwargs.selection=best
   ++actor_rollout_ref.rollout.custom.agent_framework.agent_runners.task.runner_fqn=examples.claude_code_kernel_task.runner.run_triton_task
@@ -178,7 +172,6 @@ MAIN_CMD=(
   ++actor_rollout_ref.rollout.custom.agent_framework.agent_runners.task.trajectory_selection=all
   ++actor_rollout_ref.rollout.custom.agent_framework.agent_runners.task.runner_kwargs.task_config_path=${TASK_CONFIG}
   ++actor_rollout_ref.rollout.custom.agent_framework.agent_runners.task.runner_kwargs.model_name=${SERVED_MODEL_NAME}
-  ++actor_rollout_ref.rollout.custom.agent_framework.agent_runners.task.runner_kwargs.max_response_length=${max_response_length}
   ++actor_rollout_ref.rollout.custom.agent_framework.agent_runners.task.runner_kwargs.validation_max_turns=${VALIDATION_MAX_TURNS}
   ++actor_rollout_ref.rollout.custom.agent_framework.agent_runners.task.runner_kwargs.validation_run_timeout=${VALIDATION_RUN_TIMEOUT}
   "++actor_rollout_ref.rollout.custom.agent_framework.agent_runners.task.runner_kwargs.remote_docker_hosts=${REMOTE_DOCKER_HOSTS_PARSER}"

@@ -22,6 +22,8 @@ pytestmark = [pytest.mark.cpu, pytest.mark.level0]
 )
 def test_split_budgets(monkeypatch, split, overrides, expected):
     original = {"task": {"metadata": {"split": split}, "agent": {"max_turns": 100, "run_timeout": 7200}}}
+    extra_env = {"CLAUDE_CODE_MAX_OUTPUT_TOKENS": "4096"}
+    original["task"]["agent"]["extra_env"] = extra_env
 
     async def run_task(**kwargs):
         return kwargs["tools_kwargs"]["task"]["agent"]
@@ -36,5 +38,5 @@ def test_split_budgets(monkeypatch, split, overrides, expected):
             **overrides,
         )
     )
-    assert result == expected
-    assert original["task"]["agent"] == {"max_turns": 100, "run_timeout": 7200}
+    assert result == {**expected, "extra_env": extra_env}
+    assert original["task"]["agent"] == {"max_turns": 100, "run_timeout": 7200, "extra_env": extra_env}

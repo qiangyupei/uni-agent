@@ -132,11 +132,3 @@ def attach_reward(metrics: dict[str, Any], weights: dict[str, float] | None = No
     result["reward"] = components["total"]
     result["reward_components"] = components
     return result
-
-
-def compute_score(data_source: str, solution_str: str, ground_truth: Any, extra_info=None) -> dict[str, float]:
-    """verl reward-function compatibility; task-side reward remains authoritative."""
-
-    del data_source, solution_str, ground_truth
-    score = _as_float(extra_info.get("reward_score")) if isinstance(extra_info, dict) else 0.0
-    return {"score": score}
