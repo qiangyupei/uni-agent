@@ -4,12 +4,16 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import logging
 import math
+import time
 from typing import TYPE_CHECKING, Any
 
 from uni_agent.sandbox.base import ExecResult
 from uni_agent.sandbox.docker import DockerSandbox
 from uni_agent.sandbox.registry import register_sandbox
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from uni_agent.sandbox.base import SandboxConfig
@@ -64,6 +68,28 @@ class RemoteDockerSandbox(DockerSandbox):
         if timeout is None and (args[:2] == ("image", "inspect") or args[:1] == ("rm",)):
             timeout = 30
         return await super()._run_docker("--host", self.docker_host, *args, timeout=timeout)
+
+    async def stop(self) -> None:
+        container = self._container_name
+        started = time.monotonic()
+        logger.warning("sandbox stop start: host=%s container=%s", self.docker_host, container)
+        try:
+            await super().stop()
+        except BaseException as exc:
+            logger.warning(
+                "sandbox stop failed: host=%s container=%s error=%s elapsed=%.1fs",
+                self.docker_host,
+                container,
+                type(exc).__name__,
+                time.monotonic() - started,
+            )
+            raise
+        logger.warning(
+            "sandbox stop done: host=%s container=%s elapsed=%.1fs",
+            self.docker_host,
+            container,
+            time.monotonic() - started,
+        )
 
 
 def _copy_sandbox_kwargs(tools_kwargs: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:

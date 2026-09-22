@@ -128,6 +128,7 @@ class TritonOperatorTask(Task):
         op_name: str,
     ) -> tuple[dict[str, Any], dict[str, Any], bool | None, dict[str, Any]]:
         started = time.monotonic()
+        session_id = metadata.get("runtime", {}).get("session_id", "unknown")
         agent_info: dict[str, Any]
         finished: bool | None
         # Always destroy the sandbox on success, error or cancellation.
@@ -157,8 +158,20 @@ class TritonOperatorTask(Task):
 
                 # Stop agent-time verifier children before reading their snapshots.
                 # This also releases any evaluator NPU lease.
+                cleanup_started = time.monotonic()
+                logger.warning(
+                    "task teardown: session=%s stage=pre_cleanup start timeout=%s", session_id, cfg.cleanup_timeout
+                )
                 await self._cleanup_task_processes(sandbox, cfg, workspace, required=True)
+                logger.warning(
+                    "task teardown: session=%s stage=pre_cleanup done elapsed_ms=%s",
+                    session_id,
+                    _elapsed_ms(cleanup_started),
+                )
                 evaluate_started = time.monotonic()
+                logger.warning(
+                    "task teardown: session=%s stage=evaluate start timeout=%s", session_id, cfg.evaluation_timeout
+                )
                 evaluation = await asyncio.wait_for(
                     self._evaluate_workspace(
                         sandbox,
@@ -178,6 +191,14 @@ class TritonOperatorTask(Task):
                         finished = True
                         agent_info["finished"] = True
                 evaluate_ms = _elapsed_ms(evaluate_started)
+                logger.warning("task teardown: session=%s stage=evaluate done elapsed_ms=%s", session_id, evaluate_ms)
+                collect_started = time.monotonic()
+                logger.warning(
+                    "task teardown: session=%s stage=collect start enabled=%s per_file_timeout=%s",
+                    session_id,
+                    bool(cfg.artifact_dir),
+                    cfg.artifact_timeout,
+                )
                 await self._collect_artifacts(
                     sandbox,
                     cfg,
@@ -185,11 +206,27 @@ class TritonOperatorTask(Task):
                     workspace,
                     op_name,
                 )
+                logger.warning(
+                    "task teardown: session=%s stage=collect done elapsed_ms=%s",
+                    session_id,
+                    _elapsed_ms(collect_started),
+                )
             finally:
                 # Provider stop is authoritative. An image may additionally own
                 # a bounded PID/cgroup cleanup script for accelerator processes.
                 try:
+                    cleanup_started = time.monotonic()
+                    logger.warning(
+                        "task teardown: session=%s stage=final_cleanup start timeout=%s",
+                        session_id,
+                        cfg.cleanup_timeout,
+                    )
                     await self._cleanup_task_processes(sandbox, cfg, workspace, required=False)
+                    logger.warning(
+                        "task teardown: session=%s stage=final_cleanup done elapsed_ms=%s",
+                        session_id,
+                        _elapsed_ms(cleanup_started),
+                    )
                 except Exception:  # noqa: BLE001 - best effort before mandatory sandbox.stop
                     logger.warning("task process cleanup failed for %s", op_name, exc_info=True)
         timing = {

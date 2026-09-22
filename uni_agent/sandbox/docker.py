@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import asyncio
+import logging
+import time
 import uuid
 from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING
 
 from .base import ExecResult, Sandbox, _to_str
 from .registry import register_sandbox
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from .base import SandboxConfig
@@ -56,6 +60,10 @@ class DockerSandbox(Sandbox):
         return cls(image=config.image, **config.sandbox_kwargs)
 
     async def _run_docker(self, *args: str, timeout: float | None = None) -> ExecResult:
+        started = time.monotonic()
+        # Log only operation/identity, never exec arguments containing prompts or credentials.
+        operation = args[2] if args[:1] == ("--host",) else args[0]
+        identity = f"host={getattr(self, 'docker_host', 'local')} container={self._container_name} op={operation}"
         try:
             proc = await asyncio.create_subprocess_exec(
                 self.docker_binary,
@@ -69,11 +77,27 @@ class DockerSandbox(Sandbox):
         try:
             stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
         except asyncio.TimeoutError:
+            logger.warning("docker timeout: %s pid=%s timeout=%s; killing CLI", identity, proc.pid, timeout)
             try:
                 proc.kill()
             except ProcessLookupError:
                 pass
-            await proc.communicate()
+            logger.warning("docker reap start: %s pid=%s", identity, proc.pid)
+            try:
+                await proc.communicate()
+            except asyncio.CancelledError:
+                logger.warning("docker reap cancelled: %s pid=%s", identity, proc.pid)
+                raise
+            logger.warning("docker reap done: %s pid=%s elapsed=%.1fs", identity, proc.pid, time.monotonic() - started)
+            raise
+        except asyncio.CancelledError:
+            logger.warning(
+                "docker wait cancelled: %s pid=%s returncode=%s elapsed=%.1fs",
+                identity,
+                proc.pid,
+                proc.returncode,
+                time.monotonic() - started,
+            )
             raise
 
         return ExecResult(
