@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
 import copy
 import hashlib
+import logging
 import math
+import time
+import uuid
 from typing import TYPE_CHECKING, Any
 
 from uni_agent.sandbox.base import ExecResult
@@ -13,6 +17,27 @@ from uni_agent.sandbox.registry import register_sandbox
 
 if TYPE_CHECKING:
     from uni_agent.sandbox.base import SandboxConfig
+
+logger = logging.getLogger(__name__)
+
+_LOCK_DIAGNOSTICS = """
+import json, os, pathlib, sys
+root = pathlib.Path(sys.argv[1])
+print('identity', json.dumps({'uid': os.getuid(), 'gid': os.getgid(),
+    'devices': os.environ.get('TRITON_EVAL_DEVICE_IDS'), 'configured_lock_dir': str(root),
+    'env_lock_dir': os.environ.get('TRITON_EVAL_LOCK_DIR')}))
+paths = [pathlib.Path('/var/lock'), root]
+paths += [root / ('device-' + d + '.lock')
+          for d in os.environ.get('TRITON_EVAL_DEVICE_IDS', '').split(',')[:64] if d]
+for path in paths:
+    try:
+        s = path.lstat()
+        print(json.dumps({'path': str(path), 'resolved': str(path.resolve()),
+            'mode': oct(s.st_mode), 'uid': s.st_uid, 'gid': s.st_gid,
+            'device': s.st_dev, 'inode': s.st_ino}))
+    except OSError as exc:
+        print(json.dumps({'path': str(path), 'error': str(exc)}))
+"""
 
 
 @register_sandbox("triton_remote_docker")
@@ -31,6 +56,7 @@ class RemoteDockerSandbox(DockerSandbox):
         pull_policy: str = "never",
         env: dict[str, str] | None = None,
         cwd: str | None = None,
+        session_id: str = "",
     ) -> None:
         if not docker_host:
             raise ValueError("docker_host is required")
@@ -45,6 +71,8 @@ class RemoteDockerSandbox(DockerSandbox):
             args.extend(["--env", f"{key}={value}"])
 
         self.docker_host = docker_host
+        self.session_id = session_id
+        self.npu_lock_dir = npu_lock_dir
         self.runtime_timeout = runtime_timeout
         super().__init__(
             image=image,
@@ -63,7 +91,75 @@ class RemoteDockerSandbox(DockerSandbox):
     async def _run_docker(self, *args: str, timeout: float | None = None) -> ExecResult:
         if timeout is None and (args[:2] == ("image", "inspect") or args[:1] == ("rm",)):
             timeout = 30
-        return await super()._run_docker("--host", self.docker_host, *args, timeout=timeout)
+        container = self._container_name
+        if args[:1] == ("run",) and "--name" in args:
+            container = args[args.index("--name") + 1]
+        elif args[:1] == ("rm",):
+            container = args[-1]
+        operation = args[0]
+        if operation == "exec" and container in args:
+            command_index = args.index(container) + 1
+            if command_index < len(args):
+                operation += ":" + args[command_index].rsplit("/", 1)[-1]
+        context = (
+            f"session={self.session_id} host={self.docker_host} container={container} "
+            f"operation={operation} call={uuid.uuid4().hex[:8]} timeout={timeout}"
+        )
+        started = time.monotonic()
+        # Long-running agent/verifier calls are expected; warn near their budget instead.
+        slow_after = max(15, timeout * 0.8) if timeout and timeout > 120 else 15
+        # A single pending warning also exposes commands with no configured timeout.
+        pending = asyncio.get_running_loop().call_later(
+            slow_after, logger.warning, "remote docker pending after %.1fs: %s", slow_after, context
+        )
+        try:
+            result = await super()._run_docker("--host", self.docker_host, *args, timeout=timeout)
+        except (Exception, asyncio.CancelledError) as exc:
+            logger.warning(
+                "remote docker failed: %s elapsed=%.2fs error=%s: %s",
+                context,
+                time.monotonic() - started,
+                type(exc).__name__,
+                exc,
+            )
+            raise
+        finally:
+            pending.cancel()
+        elapsed = time.monotonic() - started
+        if result.exit_code or elapsed >= slow_after:
+            logger.warning(
+                "remote docker completed: %s elapsed=%.2fs exit=%s stderr=%r",
+                context,
+                elapsed,
+                result.exit_code,
+                result.stderr[-2000:],
+            )
+        if result.exit_code and ("with_npu_lease" in result.stderr or "--check" in args):
+            await self._diagnose_locks(context)
+        return result
+
+    async def _diagnose_locks(self, context: str) -> None:
+        """Read failure-time state before teardown, without changing locks or retrying work."""
+        if not self._container_name:
+            return
+        commands = (
+            ("inspect", "--format", '{"mounts":{{json .Mounts}},"state":{{json .State}}}', self._container_name),
+            ("exec", self._container_name, "python3", "-I", "-c", _LOCK_DIAGNOSTICS, self.npu_lock_dir),
+        )
+        for command in commands:
+            try:
+                # Bypass the wrapper to avoid recursive diagnostics on failure.
+                result = await super()._run_docker("--host", self.docker_host, *command, timeout=10)
+                logger.warning(
+                    "NPU lock diagnostics: %s probe=%s exit=%s stdout=%r stderr=%r",
+                    context,
+                    command[0],
+                    result.exit_code,
+                    result.stdout[:16000],
+                    result.stderr[-2000:],
+                )
+            except Exception as exc:
+                logger.warning("NPU lock diagnostics unavailable: %s probe=%s error=%r", context, command[0], exc)
 
 
 def _copy_sandbox_kwargs(tools_kwargs: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -112,6 +208,7 @@ def bind_remote_sandbox(
     slot = int.from_bytes(hashlib.sha256(session_id.encode()).digest()[:8], "big") % len(docker_hosts)
     copied, sandbox_kwargs = _copy_sandbox_kwargs(tools_kwargs)
     sandbox_kwargs["docker_host"] = docker_hosts[slot]
+    sandbox_kwargs["session_id"] = session_id
     sandbox_kwargs["npu_lock_dir"] = lock_dir
     env = sandbox_kwargs.setdefault("env", {})
     if not isinstance(env, dict):
